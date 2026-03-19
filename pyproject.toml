@@ -1,0 +1,13 @@
+[project]
+name = "brass-lantern"
+version = "0.1.0"
+description = "Async Python client that connects an LLM to a Grue game server"
+requires-python = ">=3.10"
+dependencies = [
+    "websockets>=12.0",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+brass-lantern = "brass_lantern.__main__:main"
