@@ -41,7 +41,7 @@ python -m brass_lantern --uri ws://localhost:8080 --provider anthropic --model c
 
 ```
 ┌─────────────┐  WebSocket  ┌────────────────┐  HTTP/REST  ┌─────────┐
-│  Grue Server │◄──────────►│  Brass Lantern │────────────►│ LLM API │
+│ Grue Server │◄───-───────►│  Brass Lantern │────────────►│ LLM API │
 └─────────────┘             └────────────────┘             └─────────┘
                                │  messages[]  │
                                │ (transcript) │
