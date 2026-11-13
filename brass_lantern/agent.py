@@ -145,6 +145,8 @@ def parse_command(text: str) -> ParsedCommand:
         last = core
         if core.startswith(">"):
             body = core.lstrip("> ").strip()
+            if ">" in body:  # "> examine barrel? Let's try just this.> barrel": the last one is the move
+                body = body.rsplit(">", 1)[1].strip() or body
             if body and body.upper() != "COMMAND":  # ignore an echoed "> COMMAND" template
                 prompt_hit = body
         else:

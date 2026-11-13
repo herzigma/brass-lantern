@@ -128,3 +128,8 @@ def test_hallucinated_continuation_is_ignored():
 def test_reply_starting_with_echoed_footer_has_no_command():
     p = parse_command("[Turn 3 of 50 | Score 0]\n> north")
     assert p.method == "empty"
+
+
+def test_second_prompt_marker_on_one_line_wins():
+    p = parse_command("> examine barrel again? The parser might not understand that.> barrel")
+    assert p.command == "barrel" and p.method == "prompt"
