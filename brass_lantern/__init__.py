@@ -1,5 +1,3 @@
-"""Brass Lantern — Async LLM client for the Grue game server."""
+"""Brass Lantern: an LLM benchmark harness for Grue text-adventure servers."""
 
-from brass_lantern.client import BrassLantern
-
-__all__ = ["BrassLantern"]
+__version__ = "0.2.0"

@@ -1,39 +1,130 @@
-"""Provider registry and factory function."""
+"""Provider registry: turn a ``provider:model`` spec into a :class:`Provider`."""
 
-from brass_lantern.providers.base import AIProvider
+from __future__ import annotations
+
+import os
+from typing import Any, Mapping
+
+import httpx
+
+from brass_lantern.providers.base import Completion, ConfigError, Provider, ProviderError
+
+__all__ = [
+    "Completion",
+    "ConfigError",
+    "PROVIDER_NAMES",
+    "Provider",
+    "ProviderError",
+    "create_provider",
+    "split_spec",
+]
+
+PROVIDER_NAMES = ("openrouter", "openai", "ollama", "anthropic", "gemini", "mock", "human")
 
 
-def get_provider(name: str, api_key: str, model: str | None = None) -> AIProvider:
-    """Instantiate an :class:`AIProvider` by short name.
+def split_spec(spec: str) -> tuple[str, str]:
+    """Split ``provider:model`` on the *first* colon (models may contain colons)."""
+    provider, sep, model = spec.strip().partition(":")
+    provider = provider.lower()
+    if not sep or provider not in PROVIDER_NAMES:
+        raise ConfigError(
+            f"Bad model spec {spec!r}. Use provider:model with provider one of "
+            f"{', '.join(PROVIDER_NAMES)} (e.g. openrouter:anthropic/claude-haiku-4.5)."
+        )
+    if not model.strip() and provider != "human":
+        raise ConfigError(f"Model spec {spec!r} is missing the model name after the colon.")
+    return provider, model.strip()
 
-    Parameters
-    ----------
-    name:
-        One of ``"openai"``, ``"anthropic"``, or ``"gemini"``.
-    api_key:
-        The API key forwarded to the provider.
-    model:
-        Optional model override; each provider has a sensible default.
 
-    Raises
-    ------
-    ValueError
-        If *name* does not match a known provider.
+def _key(env: Mapping[str, str], var: str, provider: str) -> str:
+    value = (env.get(var) or "").strip()
+    if not value:
+        raise ConfigError(f"{var} is not set (needed for {provider}:). Put it in .env or export it.")
+    return value
+
+
+def create_provider(
+    spec: str,
+    *,
+    base_url: str | None = None,
+    temperature: float | None = 0.7,
+    max_tokens: int = 1024,
+    env: Mapping[str, str] | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+    sleep: Any = None,
+) -> Provider:
+    """Build a provider from a spec like ``openrouter:openai/gpt-4o-mini``.
+
+    ``base_url`` overrides the provider's endpoint (this is how ``openai:`` talks to
+    vLLM / LM Studio / Together). ``env`` defaults to ``os.environ``. Note that
+    ANTHROPIC_BASE_URL is deliberately never read.
     """
-    name = name.lower().strip()
+    env = os.environ if env is None else env
+    provider, model = split_spec(spec)
 
-    if name == "openai":
-        from brass_lantern.providers.openai import OpenAIProvider
-        return OpenAIProvider(api_key, model)
+    if provider == "mock":
+        from brass_lantern.providers.scripted import ScriptedProvider
 
-    if name == "anthropic":
-        from brass_lantern.providers.anthropic import AnthropicProvider
-        return AnthropicProvider(api_key, model)
+        try:
+            return ScriptedProvider.from_file(model, temperature=temperature, max_tokens=max_tokens)
+        except OSError as e:
+            raise ConfigError(f"Cannot read mock script {model!r}: {e}") from e
+    if provider == "human":
+        from brass_lantern.providers.scripted import HumanProvider
 
-    if name == "gemini":
-        from brass_lantern.providers.gemini import GeminiProvider
-        return GeminiProvider(api_key, model)
+        return HumanProvider(model, temperature=temperature, max_tokens=max_tokens)
 
-    raise ValueError(
-        f"Unknown provider '{name}'. Choose from: openai, anthropic, gemini"
+    common: dict[str, Any] = {"temperature": temperature, "max_tokens": max_tokens, "transport": transport}
+    if sleep is not None:
+        common["sleep"] = sleep
+
+    if provider == "anthropic":
+        from brass_lantern.providers.anthropic import ANTHROPIC_URL, AnthropicProvider
+
+        return AnthropicProvider(
+            model, api_key=_key(env, "ANTHROPIC_API_KEY", provider), base_url=base_url or ANTHROPIC_URL, **common
+        )
+    if provider == "gemini":
+        from brass_lantern.providers.gemini import GEMINI_URL, GeminiProvider
+
+        return GeminiProvider(
+            model, api_key=_key(env, "GEMINI_API_KEY", provider), base_url=base_url or GEMINI_URL, **common
+        )
+
+    from brass_lantern.providers.openai_compat import (
+        OLLAMA_URL,
+        OPENAI_URL,
+        OPENROUTER_URL,
+        OpenAICompatProvider,
+    )
+
+    if provider == "openrouter":
+        return OpenAICompatProvider(
+            model,
+            base_url=base_url or OPENROUTER_URL,
+            api_key=_key(env, "OPENROUTER_API_KEY", provider),
+            name="openrouter",
+            extra_headers={
+                "HTTP-Referer": (env.get("OPENROUTER_REFERER") or "https://brass-lantern.local"),
+                "X-Title": "Brass Lantern",
+            },
+            extra_body={"usage": {"include": True}},  # makes OpenRouter return usage.cost in USD
+            **common,
+        )
+    if provider == "ollama":
+        return OpenAICompatProvider(model, base_url=base_url or OLLAMA_URL, name="ollama", **common)
+
+    # provider == "openai"
+    if base_url:
+        # Generic OpenAI-compatible server: the key is optional (local servers often have none).
+        return OpenAICompatProvider(
+            model, base_url=base_url, api_key=(env.get("OPENAI_API_KEY") or "").strip() or None, name="openai", **common
+        )
+    return OpenAICompatProvider(
+        model,
+        base_url=OPENAI_URL,
+        api_key=_key(env, "OPENAI_API_KEY", provider),
+        name="openai",
+        token_param="max_completion_tokens",  # newer OpenAI models reject max_tokens
+        **common,
     )
