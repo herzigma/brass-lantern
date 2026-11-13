@@ -34,6 +34,7 @@ class BenchConfig:
     notes: bool = False
     temperature: float | None = 0.7
     max_tokens: int = 1024
+    reasoning: str | None = None
     base_url: str | None = None
     grue_url: str | None = None
     out_dir: Path = Path("runs")
@@ -56,7 +57,8 @@ async def run_bench(
 
     def make_provider(spec: str) -> Provider:
         return provider_factory(
-            spec, base_url=cfg.base_url, temperature=cfg.temperature, max_tokens=cfg.max_tokens
+            spec, base_url=cfg.base_url, temperature=cfg.temperature, max_tokens=cfg.max_tokens,
+            reasoning=cfg.reasoning,
         )
 
     for spec in cfg.models:  # fail fast on bad specs / missing keys, before spending anything
@@ -81,6 +83,7 @@ async def run_bench(
                 notes=cfg.notes,
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
+                reasoning=cfg.reasoning,
                 base_url=cfg.base_url,
                 grue_url=cfg.grue_url,
                 out_dir=out,

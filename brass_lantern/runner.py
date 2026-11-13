@@ -30,6 +30,7 @@ class RunConfig:
     notes: bool = False
     temperature: float | None = 0.7
     max_tokens: int = 1024
+    reasoning: str | None = None
     base_url: str | None = None  # provider endpoint override
     grue_url: str | None = None
     out_dir: Path = Path("runs")
@@ -137,6 +138,7 @@ async def play_episode(
                 "notes": cfg.notes,
                 "temperature": cfg.temperature,
                 "max_tokens": cfg.max_tokens,
+                "reasoning": cfg.reasoning,
                 "provider": provider.describe(),
                 "meta": meta,
             },

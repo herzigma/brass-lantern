@@ -49,6 +49,7 @@ def create_provider(
     base_url: str | None = None,
     temperature: float | None = 0.7,
     max_tokens: int = 1024,
+    reasoning: str | None = None,
     env: Mapping[str, str] | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     sleep: Any = None,
@@ -108,7 +109,9 @@ def create_provider(
                 "HTTP-Referer": (env.get("OPENROUTER_REFERER") or "https://brass-lantern.local"),
                 "X-Title": "Brass Lantern",
             },
-            extra_body={"usage": {"include": True}},  # makes OpenRouter return usage.cost in USD
+            # usage.include makes OpenRouter return usage.cost in USD; reasoning.effort is
+            # OpenRouter's vendor-neutral control for reasoning models.
+            extra_body={"usage": {"include": True}, **({"reasoning": {"effort": reasoning}} if reasoning else {})},
             **common,
         )
     if provider == "ollama":
@@ -124,6 +127,7 @@ def create_provider(
         model,
         base_url=OPENAI_URL,
         api_key=_key(env, "OPENAI_API_KEY", provider),
+        extra_body={"reasoning_effort": reasoning} if reasoning else None,
         name="openai",
         token_param="max_completion_tokens",  # newer OpenAI models reject max_tokens
         **common,

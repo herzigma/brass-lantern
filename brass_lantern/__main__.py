@@ -76,6 +76,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--temperature", type=_temperature, default=0.7,
                    help="sampling temperature (default: 0.7); 'none' omits it, for models that reject it")
     p.add_argument("--max-tokens", type=int, default=1024, help="max output tokens per reply (default: 1024)")
+    p.add_argument("--reasoning", choices=["minimal", "low", "medium", "high"],
+                   help="reasoning effort for reasoning models (openrouter, openai); default: provider default")
     p.add_argument("--base-url", help="override the provider's API base URL (e.g. a vLLM or LM Studio server)")
     p.add_argument("--prices", metavar="FILE",
                    help="JSON of per-model USD/1M-token prices, so --max-cost works for providers that report no cost")
@@ -140,10 +142,11 @@ async def _games(args: argparse.Namespace) -> int:
 
 async def _play(args: argparse.Namespace) -> int:
     prices = load_prices(args.prices)
-    provider = create_provider(args.model, base_url=args.base_url, temperature=args.temperature, max_tokens=args.max_tokens)
+    provider = create_provider(args.model, base_url=args.base_url, temperature=args.temperature, max_tokens=args.max_tokens,
+                               reasoning=args.reasoning)
     cfg = RunConfig(
         game=args.game, model=args.model, max_turns=args.max_turns, max_cost=args.max_cost, max_time=args.max_time,
-        history=args.history, notes=args.notes, temperature=args.temperature, max_tokens=args.max_tokens,
+        history=args.history, notes=args.notes, temperature=args.temperature, max_tokens=args.max_tokens, reasoning=args.reasoning,
         base_url=args.base_url, grue_url=args.grue_url, out_dir=Path(args.out), run_id=args.run_id,
         quiet=args.quiet, meta=dict(args.seed_meta), price=prices.get(args.model),
     )
@@ -169,7 +172,7 @@ async def _bench(args: argparse.Namespace) -> int:
             models=args.models, games=games, runs=args.runs, max_turns=args.max_turns, concurrency=args.concurrency,
             max_cost_per_run=args.max_cost_per_run, max_time_per_run=args.max_time_per_run, history=args.history,
             notes=args.notes, temperature=args.temperature, max_tokens=args.max_tokens, base_url=args.base_url,
-            grue_url=args.grue_url, out_dir=out, prices=load_prices(args.prices),
+            reasoning=args.reasoning, grue_url=args.grue_url, out_dir=out, prices=load_prices(args.prices),
         )
         total = len(cfg.models) * len(cfg.games) * cfg.runs
         print(f"bench: {len(cfg.models)} models x {len(cfg.games)} games x {cfg.runs} runs = {total} episodes "
