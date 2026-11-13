@@ -116,13 +116,23 @@ def test_notes_ignored_when_disabled():
 
 
 def test_decision_command_and_fallbacks():
-    p = FakeProvider(["I will go.\n> go north", "just text", "", "", "> take lamp then north"])
+    p = FakeProvider([
+        "I will go.\n> go north",
+        "just text",
+        "Turns are limited, so I'll make steady progress toward the chasm.", "> south",
+        "", "",
+        "", "",
+        "> take lamp then north",
+    ])
     a = Agent(p)
     d = act(a, obs())
     assert d.command == "go north" and d.parsed.ok
     d = act(a, obs())
     assert d.command == "just text" and not d.parsed.ok and d.parsed.method == "last_line"
-    d = act(a, obs())  # empty reply -> harmless "look"
+    d = act(a, obs())  # prose without a marker -> one format-repair call
+    assert d.command == "south" and d.parsed.method == "repair" and not d.parsed.ok
+    assert "[format repair]" in d.reply
+    d = act(a, obs())  # empty reply (and empty repair) -> harmless "look"
     assert d.command == "look" and d.parsed.method == "empty"
     d = act(a, Observation(turn=1, text="Press a key", input_type="char"))  # empty in char mode -> return
     assert d.command == "return"

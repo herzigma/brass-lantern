@@ -44,6 +44,8 @@ def now_iso() -> str:
 
 
 def make_run_id(game: str, model: str) -> str:
+    if model.startswith("mock:"):  # a script path: keep just the file name
+        model = "mock-" + Path(model[5:]).stem
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", model).strip("-")[:40]
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return f"{stamp}-{game}-{slug}-{secrets.token_hex(2)}"

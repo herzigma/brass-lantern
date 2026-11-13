@@ -73,7 +73,7 @@ _QUOTE_MAP = str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"})
 @dataclass
 class ParsedCommand:
     command: str
-    method: str  # "prompt" (> CMD) | "tag" (COMMAND: CMD) | "last_line" | "empty"
+    method: str  # "prompt" (> CMD) | "tag" (COMMAND: CMD) | "last_line" | "repair" | "empty"
 
     @property
     def ok(self) -> bool:
@@ -193,6 +193,42 @@ def compact_reply(text: str, command: str, parsed: ParsedCommand | None = None) 
     return f"{reasoning}\n> {command}" if reasoning else f"> {command}"
 
 
+
+REPAIR_PROMPT = (
+    "Your reply did not end with a command line. Reply with ONLY the single game command you "
+    "want to send, on one line starting with \">\", for example:\n> north"
+)
+
+_SENTENCE = re.compile(r"[.!?]\s+\S|[.!?]$")
+
+
+def looks_like_prose(command: str) -> bool:
+    """True when a fallback 'command' is really a sentence of reasoning, not a game command."""
+    words = command.split()
+    if not words:
+        return True
+    return len(words) > 8 or (len(words) > 3 and bool(_SENTENCE.search(command)))
+
+
+def _raw_last_line(text: str) -> str:
+    """The last non-empty line of a reply, before any command clean-up."""
+    lines = [_core(l) for l in _THINK.sub("", text or "").splitlines()]
+    lines = [l for l in lines if l]
+    return lines[-1] if lines else ""
+
+
+def _merge(a: Completion, b: Completion) -> Completion:
+    """Combine the accounting of a reply and its format-repair follow-up."""
+    cost = None if a.cost_usd is None and b.cost_usd is None else (a.cost_usd or 0) + (b.cost_usd or 0)
+    return Completion(
+        text=a.text + "\n\n[format repair]\n" + b.text,
+        input_tokens=a.input_tokens + b.input_tokens,
+        output_tokens=a.output_tokens + b.output_tokens,
+        cost_usd=cost,
+        latency_s=a.latency_s + b.latency_s,
+        finish_reason=b.finish_reason,
+    )
+
 # ---------------------------------------------------------------------------
 # The agent
 # ---------------------------------------------------------------------------
@@ -265,6 +301,19 @@ class Agent:
         messages = self.build_messages(obs)
         completion = await self.provider.complete(self.system_prompt, messages)
         parsed = parse_command(completion.text)
+        if not parsed.ok and looks_like_prose(_raw_last_line(completion.text)):
+            # The model forgot the "> COMMAND" line and its last line is prose. Ask once for
+            # just the command rather than sending a sentence to the parser. Still counted as
+            # a format (parse) failure; the extra call's tokens and cost are added in.
+            repair_messages = messages + [
+                {"role": "assistant", "content": completion.text or "(empty reply)"},
+                {"role": "user", "content": REPAIR_PROMPT},
+            ]
+            fix = await self.provider.complete(self.system_prompt, repair_messages)
+            fixed = parse_command(fix.text)
+            completion = _merge(completion, fix)
+            if fixed.command and not looks_like_prose(fixed.command):
+                parsed = ParsedCommand(fixed.command, "repair")
         command = parsed.command or ("return" if obs.input_type == "char" else "look")
         if self.notes_enabled:
             new_notes = extract_notes(completion.text)
