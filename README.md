@@ -19,7 +19,7 @@ Needs Python 3.10+. If `brass-lantern` is not on your PATH, `python -m brass_lan
 
 ## Quickstart (against a local Grue)
 
-Start Grue so its REST API is on `http://localhost:8081` (override with `GRUE_URL` or `--grue-url`), then:
+Start Grue so its REST API is on `http://127.0.0.1:8081` (override with `GRUE_URL` or `--grue-url`), then:
 
 ```bash
 brass-lantern games                                   # what the server offers

@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-DEFAULT_GRUE_URL = "http://localhost:8081"
+DEFAULT_GRUE_URL = "http://127.0.0.1:8081"
 # Drop idle pooled connections after 2s, below Grue's server keep-alive timeout, so we do not
 # reuse a connection the server is about to close.
 KEEPALIVE_EXPIRY_S = 2.0

@@ -29,7 +29,7 @@ model specs (provider:model):
   mock:script.txt                         replay commands from a file (dry runs, no API calls)
   human:                                  type the commands yourself (debugging the harness)
 
-environment: GRUE_URL (default http://localhost:8081), GRUE_API_KEY; values may live in a .env file.
+environment: GRUE_URL (default http://127.0.0.1:8081), GRUE_API_KEY; values may live in a .env file.
 """
 
 
@@ -77,7 +77,7 @@ def uncapped_models(models: Sequence[str], prices: dict[str, tuple[float, float]
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--grue-url", help="Grue server URL (default: $GRUE_URL or http://localhost:8081)")
+    p.add_argument("--grue-url", help="Grue server URL (default: $GRUE_URL or http://127.0.0.1:8081)")
     p.add_argument("--max-turns", type=int, default=150, help="turn limit per episode (default: 150)")
     p.add_argument("--history", type=int, default=30, help="recent turns kept verbatim in context (default: 30)")
     p.add_argument("--notes", action="store_true", help="give the model a NOTES: scratchpad that persists across turns")
