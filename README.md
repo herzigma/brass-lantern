@@ -149,6 +149,12 @@ if the connection fails before any response arrives (`RemoteProtocolError` or `C
 requests (`GET`, `DELETE`). `POST .../commands` is never retried because the command may already have run; such a failure
 ends the run as `grue_error` with a message saying so.
 
+## Results
+
+The first benchmark (9 models, 4 games, Nov 2026) is written up in
+[docs/results/2026-11-13.md](docs/results/2026-11-13.md). Its main finding is that the original games, Skerrin Light
+in particular, separate models far better than Zork I. Run Skerrin Light at 300 turns.
+
 ## Adding a provider
 
 1. Subclass `Provider` (or `HTTPProvider`, which gives you the pooled client and retry/backoff) in
