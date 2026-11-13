@@ -27,7 +27,7 @@ class BenchConfig:
     models: list[str]
     games: list[str]
     runs: int = 3
-    max_turns: int = 150
+    max_turns: int | None = None
     concurrency: int = 4
     max_cost_per_run: float | None = None
     max_time_per_run: float | None = None

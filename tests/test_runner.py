@@ -59,7 +59,9 @@ def test_full_win_end_to_end(tmp_path, fake, make_grue):
     assert run["config"]["temperature"] == 0.5 and run["config"]["history"] == 30
     # session meta sent to Grue
     start = next(b for m, p, b in fake.requests if (m, p) == ("POST", "/api/sessions"))
-    assert start["max_turns"] == 150 and start["game"] == "tiny"
+    # no --max-turns: the request omits it so Grue applies the game's suggested limit
+    assert "max_turns" not in start and start["game"] == "tiny"
+    assert any((m, p) == ("GET", f"/api/sessions/{run['session_id']}") for m, p, _ in fake.requests)
     assert start["meta"]["agent"].startswith("brass-lantern/") and start["meta"]["run_id"] == "r1"
     assert start["meta"]["model"] == "mock:win" and start["meta"]["temperature"] == 0.5
     # transcript: one entry per command + final entry

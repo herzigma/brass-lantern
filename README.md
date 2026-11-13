@@ -60,9 +60,10 @@ empty too, the harness plays `look` and records a parse failure (raise `--max-to
 ```bash
 brass-lantern games
 brass-lantern play  --game zork1 --model SPEC [--max-turns 150] [--max-cost 0.5] [--max-time 900]
+# --max-turns defaults to the game's suggested limit from the Grue catalog (e.g. 300 for skerrin-light)
                     [--history 30] [--notes] [--temperature 0.7|none] [--max-tokens 1024]
                     [--base-url URL] [--out runs] [--quiet] [--seed-meta KEY=VALUE]
-brass-lantern bench --models a,b,c --games x,y --runs 3 --max-turns 150 --concurrency 4 \
+brass-lantern bench --models a,b,c --games x,y --runs 3 --concurrency 4 \
                     --max-cost-per-run 0.50 --out runs/bench-demo
 brass-lantern report runs/bench-demo
 ```

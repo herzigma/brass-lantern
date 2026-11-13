@@ -21,13 +21,14 @@ from brass_lantern.providers import Completion, Provider, ProviderError
 
 # Model calls per episode are capped at this multiple of max_turns, in case the server stops advancing turns.
 MAX_CALLS_FACTOR = 3
+DEFAULT_MAX_TURNS = 1000  # matches Grue's DEFAULT_MAX_TURNS, used if the server does not say
 
 
 @dataclass
 class RunConfig:
     game: str
     model: str  # the provider:model spec, recorded in run.json
-    max_turns: int = 150
+    max_turns: int | None = None  # None: the game's suggested limit (server decides)
     max_cost: float | None = None  # USD
     max_time: float | None = None  # seconds
     history: int = 30
@@ -183,7 +184,7 @@ async def play_episode(
         return summary
 
     write_run_json(final=False)
-    reporter.start(run_id, cfg.game, cfg.model, cfg.max_turns)
+    reporter.start(run_id, cfg.game, cfg.model, cfg.max_turns or "the game's suggested")
 
     with (run_dir / "transcript.jsonl").open("w", encoding="utf-8") as transcript:
 
@@ -194,14 +195,22 @@ async def play_episode(
         try:
             obs = await grue.start_session(cfg.game, cfg.max_turns, meta)
             session_id = obs.session_id
-            agent = Agent(provider, max_turns=cfg.max_turns, history=cfg.history, notes=cfg.notes)
+            max_turns = cfg.max_turns
+            if max_turns is None:  # learn the limit the server applied (the game's suggested one)
+                try:
+                    summary, _ = await grue.get_session(session_id)
+                    max_turns = summary.get("max_turns")
+                except GrueError:
+                    pass
+                max_turns = max_turns or DEFAULT_MAX_TURNS
+            agent = Agent(provider, max_turns=max_turns, history=cfg.history, notes=cfg.notes)
             reporter.observation(obs.text)
 
             while not obs.game_over:
-                if obs.turn >= cfg.max_turns:
+                if obs.turn >= max_turns:
                     stop_reason = "max_turns"
                     break
-                if totals.turns >= MAX_CALLS_FACTOR * cfg.max_turns:
+                if totals.turns >= MAX_CALLS_FACTOR * max_turns:
                     # Grue did not advance `turn` (e.g. "command was not sent" notices): bound the model calls.
                     stop_reason = "max_calls"
                     break
