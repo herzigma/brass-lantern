@@ -111,3 +111,32 @@ def test_prices_file(tmp_path):
     f.write_text("nope", encoding="utf-8")
     with pytest.raises(cli.ConfigError):
         cli.load_prices(str(f))
+
+
+def test_bench_refuses_cost_cap_that_cannot_be_enforced(patched_grue, tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    out = tmp_path / "b"
+    args = ["bench", "--models", "anthropic:claude-x,openai:gpt-y,mock:nothing.txt", "--games", "tiny", "--runs", "1",
+            "--max-cost-per-run", "0.5", "--out", str(out)]
+    assert cli.main(args) == 2
+    err = capsys.readouterr().err
+    assert "anthropic:claude-x" in err and "openai:gpt-y" in err and "mock:nothing.txt" not in err
+    assert "--max-cost-per-run" in err and "--prices" in err
+    assert not out.exists() and patched_grue.requests == []  # nothing ran, no session started
+
+    # a price for one of them is not enough: the other is still named
+    prices = tmp_path / "p.json"
+    prices.write_text(json.dumps({"anthropic:claude-x": {"input": 3, "output": 15}}), encoding="utf-8")
+    assert cli.main([*args, "--prices", str(prices)]) == 2
+    err = capsys.readouterr().err
+    assert "openai:gpt-y" in err and "anthropic:claude-x" not in err
+
+
+def test_bench_cost_cap_allowed_with_prices_openrouter_or_no_cap(patched_grue, tmp_path, monkeypatch):
+    assert cli.uncapped_models(["openrouter:a/b", "mock:x", "human:", "gemini:g", "ollama:l"], {"gemini:g": (1.0, 2.0)}) == ["ollama:l"]
+    # no cap requested: any provider is fine (the guard only applies with --max-cost-per-run)
+    idle = tmp_path / "idle.txt"
+    idle.write_text("north\n", encoding="utf-8")
+    assert cli.main(["bench", "--models", f"mock:{idle}", "--games", "tiny", "--runs", "1", "--max-turns", "2",
+                     "--max-cost-per-run", "1", "--out", str(tmp_path / "ok")]) == 0

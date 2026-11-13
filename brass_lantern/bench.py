@@ -17,7 +17,8 @@ from brass_lantern.grue_client import GrueClient
 from brass_lantern.providers import Provider, create_provider
 from brass_lantern.runner import RunConfig, make_run_id, play_episode
 
-# Runs that did not finish for infrastructure reasons say nothing about the model.
+# Runs that did not finish for infrastructure reasons say nothing about the model
+# (a provider_error that played at least one turn is the exception; see _counted).
 EXCLUDED_STATUSES = ("error", "interrupted", "running")
 
 
@@ -132,29 +133,86 @@ def load_runs(directory: str | Path) -> list[dict[str, Any]]:
     return runs
 
 
+# Settings that change how a model plays; runs of one spec with different values are separate rows.
+CONFIG_KNOBS = ("notes", "temperature", "history", "reasoning", "max_tokens", "max_turns")
+
+
+def _counted(run: dict[str, Any], turns: int) -> tuple[bool, str | None]:
+    """Does this run count towards scores? Returns (counted, reason it was excluded)."""
+    status, stop = run.get("status"), run.get("stop_reason")
+    if status not in EXCLUDED_STATUSES:
+        return True, None
+    if stop == "provider_error":  # the model/provider failed: a real outcome once it has played
+        return (True, None) if turns >= 1 else (False, "provider_error (no turns played)")
+    return False, stop or status  # harness problems: grue_error, interrupted, error, still running
+
+
 def _flat(run: dict[str, Any]) -> dict[str, Any]:
     t = run["totals"]
+    cfg = run.get("config") or {}
     score, max_score = t.get("score"), t.get("max_score")
+    turns = t.get("turns") or 0
+    counted, reason = _counted(run, turns)
+    if counted and score is None and max_score and max_score > 0:
+        score = 0  # finished without ever reporting a score: that is a 0, not a missing value
     return {
         "run_id": run.get("run_id"),
         "model": run["model"],
+        "variant": run["model"],  # set by aggregate(): model spec, plus a config suffix when configs differ
         "game": run.get("game"),
         "status": run.get("status"),
         "stop_reason": run.get("stop_reason"),
+        "counted": counted,
+        "excluded_reason": reason,
         "ending": t.get("ending"),
         "score": score,
         "max_score": max_score,
         "max_score_reached": t.get("max_score_reached"),
         "norm": (score / max_score) if score is not None and max_score else None,
-        "turns": t.get("turns") or 0,
+        "turns": turns,
         "invalid_commands": t.get("invalid_commands") or 0,
         "parse_failures": t.get("parse_failures") or 0,
         "input_tokens": t.get("input_tokens") or 0,
         "output_tokens": t.get("output_tokens") or 0,
         "cost_usd": t.get("cost_usd"),
         "wall_time_s": t.get("wall_time_s"),
-        "temperature": (run.get("config") or {}).get("temperature"),
+        "temperature": cfg.get("temperature"),
+        "history": cfg.get("history"),
+        "notes": bool(cfg.get("notes")),
+        "reasoning": cfg.get("reasoning"),
+        "max_tokens": cfg.get("max_tokens"),
+        "max_turns": cfg.get("max_turns"),
     }
+
+
+def _knob_text(name: str, value: Any) -> str:
+    if name == "notes":
+        return "notes" if value else "no notes"
+    short = {"temperature": "t", "history": "h", "max_turns": "turns"}.get(name, name)
+    if value is None:
+        value = {"temperature": "none", "reasoning": "default"}.get(name, "?")
+    return f"{short}={value}"
+
+
+def _variants(flat: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Group runs by model spec + behaviour-changing config. Returns label -> {spec, config}.
+
+    One config per spec keeps the plain spec as its label; several configs get a suffix naming
+    only the knobs that differ, e.g. ``openrouter:x (notes, h=30)``. Sets each row's ``variant``.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for spec in sorted({r["model"] for r in flat}):
+        mine = [r for r in flat if r["model"] == spec]
+        configs = sorted({tuple(r[k] for k in CONFIG_KNOBS) for r in mine}, key=repr)
+        differing = [k for i, k in enumerate(CONFIG_KNOBS) if len({c[i] for c in configs}) > 1]
+        for cfg in configs:
+            values = dict(zip(CONFIG_KNOBS, cfg))
+            label = spec if len(configs) == 1 else f"{spec} ({', '.join(_knob_text(k, values[k]) for k in differing)})"
+            out[label] = {"spec": spec, "config": values}
+            for r in mine:
+                if tuple(r[k] for k in CONFIG_KNOBS) == cfg:
+                    r["variant"] = label
+    return out
 
 
 def _mean(values: list[float]) -> float | None:
@@ -167,6 +225,7 @@ def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     norms = [r["norm"] for r in rows if r["norm"] is not None]
     return {
         "runs": len(rows),
+        "provider_errors": sum(r["stop_reason"] == "provider_error" for r in rows),
         "mean_score": _mean(scores),
         "best_score": max(scores) if scores else None,
         "max_score": next((r["max_score"] for r in rows if r["max_score"]), None),
@@ -186,21 +245,27 @@ def _cost(rows: list[dict[str, Any]]) -> float | None:
 def aggregate(runs: list[dict[str, Any]]) -> dict[str, Any]:
     flat = [_flat(r) for r in runs]
     games = sorted({r["game"] for r in flat})
+    variants = _variants(flat)
+    # Games with a known max score are the ones that can be normalized and ranked on.
+    ranked_games = [g for g in games if any(r["game"] == g and r["max_score"] for r in flat)]
     models: dict[str, Any] = {}
-    for model in sorted({r["model"] for r in flat}):
-        mine = [r for r in flat if r["model"] == model]
-        valid = [r for r in mine if r["status"] not in EXCLUDED_STATUSES]
+    for label, info in variants.items():
+        mine = [r for r in flat if r["variant"] == label]
+        valid = [r for r in mine if r["counted"]]
         per_game = {g: _stats([r for r in valid if r["game"] == g]) for g in games if any(r["game"] == g for r in valid)}
         for g, s in per_game.items():
             s["cost_usd"] = _cost([r for r in mine if r["game"] == g])
         overall = _stats(valid)
-        # Games weigh equally: average the per-game mean normalized scores.
-        overall["norm_score"] = _mean([s["mean_norm"] for s in per_game.values() if s["mean_norm"] is not None])
-        overall["cost_usd"] = _cost(mine)  # money spent counts even on errored runs
+        # Games weigh equally, and a ranked game with no scored run counts as 0 (never skipped), so a
+        # model cannot climb the ranking by failing on the hard games.
+        norms = {g: (per_game[g]["mean_norm"] if g in per_game else None) for g in ranked_games}
+        overall["missing_games"] = [g for g, n in norms.items() if n is None]
+        overall["norm_score"] = _mean([n if n is not None else 0.0 for n in norms.values()])
+        overall["cost_usd"] = _cost(mine)  # money spent counts even on excluded runs
         overall["input_tokens"] = sum(r["input_tokens"] for r in mine)
         overall["output_tokens"] = sum(r["output_tokens"] for r in mine)
         overall["excluded_runs"] = len(mine) - len(valid)
-        models[model] = {"overall": overall, "games": per_game}
+        models[label] = {"spec": info["spec"], "config": info["config"], "overall": overall, "games": per_game}
 
     ranking = sorted(
         models,
@@ -210,12 +275,18 @@ def aggregate(runs: list[dict[str, Any]]) -> dict[str, Any]:
             models[m]["overall"]["cost_usd"] or 0,
         ),
     )
+    excluded = [
+        {"run_id": r["run_id"], "model": r["variant"], "game": r["game"], "reason": r["excluded_reason"]}
+        for r in flat if not r["counted"]
+    ]
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "n_runs": len(runs),
         "games": games,
+        "ranked_games": ranked_games,
         "ranking": ranking,
         "models": models,
+        "excluded": excluded,
         "rows": flat,
     }
 
@@ -228,6 +299,9 @@ def _num(x: float | None, digits: int = 1) -> str:
     return "n/a" if x is None else f"{x:.{digits}f}"
 
 
+MAX_EXCLUDED_LISTED = 50
+
+
 def render_leaderboard(agg: dict[str, Any]) -> str:
     models, games = agg["models"], agg["games"]
     lines = [
@@ -235,23 +309,38 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
         "",
         f"{agg['n_runs']} runs, {len(models)} models, {len(games)} games. Generated {agg['generated_at']}.",
         "",
-        "Score is the final in-game score as a share of the game's maximum. Overall = mean of per-game "
-        "means (games weigh equally). Win = game ended `won`. Invalid % = parser rejections per command "
-        "(server-reported). Format fail % = replies without a `> COMMAND` line. Runs that errored or were "
-        "interrupted are excluded from scores but their cost is counted.",
+        "**Score formula.** A run's score is its final in-game score divided by the game's maximum "
+        "(a finished run that never reported a score counts as 0; games without a maximum are left out of "
+        "the ranking). A model's per-game score is the mean over its valid runs in that game. Its overall "
+        "score is the mean over ALL games in the bench that have a maximum score: a game where the model has "
+        "no valid run counts as 0 and is marked `*`, so failing on hard games cannot raise its rank.",
+        "",
+        "**Valid runs.** Completed runs, including those stopped by turn, time or cost limits, plus runs that "
+        "ended in a `provider_error` after at least one turn (scored as reached and counted in Errors). Runs "
+        "that hit a harness problem (`grue_error`, `interrupted`, `error`) are excluded and listed at the end; "
+        "their cost still counts. Rows with the same model spec but different settings (temperature, history, "
+        "notes, reasoning, max tokens, max turns) are separate rows, labelled with the differing settings.",
+        "",
+        "Win = game ended `won`. Invalid % = parser rejections per command (server-reported). Format fail % = "
+        "replies without a `> COMMAND` line. Errors = valid runs that ended in a provider error.",
         "",
         "## Overall ranking",
         "",
-        "| # | Model | Score | Win rate | Mean turns | Invalid % | Format fail % | Cost | Runs (excl.) |",
-        "|--:|---|--:|--:|--:|--:|--:|--:|--:|",
+        "| # | Model | Score | Win rate | Mean turns | Invalid % | Format fail % | Cost | Runs (excl.) | Errors |",
+        "|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|",
     ]
+    any_missing = False
     for rank, m in enumerate(agg["ranking"], 1):
         o = models[m]["overall"]
+        star = " \\*" if o["missing_games"] else ""
+        any_missing = any_missing or bool(o["missing_games"])
         lines.append(
-            f"| {rank} | `{m}` | {_pct(o['norm_score'])} | {_pct(o['win_rate'], 0)} | {_num(o['mean_turns'], 0)} | "
+            f"| {rank} | `{m}` | {_pct(o['norm_score'])}{star} | {_pct(o['win_rate'], 0)} | {_num(o['mean_turns'], 0)} | "
             f"{_pct(o['invalid_rate'])} | {_pct(o['parse_failure_rate'])} | {fmt_cost(o['cost_usd'])} | "
-            f"{o['runs']} ({o['excluded_runs']}) |"
+            f"{o['runs']} ({o['excluded_runs']}) | {o['provider_errors']} |"
         )
+    if any_missing:
+        lines += ["", "\\* counts at least one game with no valid run as 0 (see the `- (=0)` cells below)."]
     if games:
         lines += ["", "## Mean score by game", "", "| Model | " + " | ".join(games) + " |", "|---|" + "--:|" * len(games)]
         for m in agg["ranking"]:
@@ -259,7 +348,7 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
             for g in games:
                 s = models[m]["games"].get(g)
                 if not s:
-                    cells.append("-")
+                    cells.append("- (=0)" if g in agg["ranked_games"] else "-")
                 elif s["max_score"]:
                     cells.append(f"{_num(s['mean_score'])} ({_pct(s['mean_norm'], 0)})")
                 else:
@@ -271,8 +360,8 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
             "",
             f"## {g}" + (f" (max score {max_score})" if max_score else ""),
             "",
-            "| Model | Mean score | % of max | Best | Win rate | Mean turns | Invalid % | Cost | Runs |",
-            "|---|--:|--:|--:|--:|--:|--:|--:|--:|",
+            "| Model | Mean score | % of max | Best | Win rate | Mean turns | Invalid % | Cost | Runs | Errors |",
+            "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|",
         ]
         for m in agg["ranking"]:
             s = models[m]["games"].get(g)
@@ -281,15 +370,23 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
             lines.append(
                 f"| `{m}` | {_num(s['mean_score'])} | {_pct(s['mean_norm'])} | {s['best_score']} | "
                 f"{_pct(s['win_rate'], 0)} | {_num(s['mean_turns'], 0)} | {_pct(s['invalid_rate'])} | "
-                f"{fmt_cost(s['cost_usd'])} | {s['runs']} |"
+                f"{fmt_cost(s['cost_usd'])} | {s['runs']} | {s['provider_errors']} |"
             )
+    excluded = agg["excluded"]
+    if excluded:
+        lines += ["", "## Excluded runs", "", "| Run | Model | Game | Reason |", "|---|---|---|---|"]
+        for e in excluded[:MAX_EXCLUDED_LISTED]:
+            lines.append(f"| {e['run_id']} | `{e['model']}` | {e['game']} | {e['reason']} |")
+        if len(excluded) > MAX_EXCLUDED_LISTED:
+            lines.append(f"| ... {len(excluded) - MAX_EXCLUDED_LISTED} more (see results.csv) | | | |")
     return "\n".join(lines) + "\n"
 
 
 CSV_FIELDS = [
-    "run_id", "model", "game", "status", "stop_reason", "ending", "score", "max_score", "max_score_reached",
-    "norm", "turns", "invalid_commands", "parse_failures", "input_tokens", "output_tokens", "cost_usd",
-    "wall_time_s", "temperature",
+    "run_id", "model", "variant", "game", "status", "stop_reason", "counted", "excluded_reason", "ending",
+    "score", "max_score", "max_score_reached", "norm", "turns", "invalid_commands", "parse_failures",
+    "input_tokens", "output_tokens", "cost_usd", "wall_time_s", "temperature", "history", "notes", "reasoning",
+    "max_tokens", "max_turns",
 ]
 
 

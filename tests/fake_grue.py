@@ -29,6 +29,7 @@ class FakeGrue:
         self.requests: list[tuple[str, str, dict | None]] = []
         self.seen_auth: list[str | None] = []
         self.deleted: list[str] = []
+        self.stall_after_turn: int | None = None  # once reached, commands are "not sent" and turn stops advancing
         self._n = 0
 
     # -- plumbing ----------------------------------------------------------
@@ -134,6 +135,10 @@ class FakeGrue:
             return self._err(404, "unknown_session")
         if s["game_over"]:
             return self._err(409, "game_over")
+        if self.stall_after_turn is not None and s["turn"] >= self.stall_after_turn:
+            busy = self._obs(s, "Late output from the previous command.")
+            busy["notice"] = "Previous command is still running; this command was not sent."
+            return self._json(200, busy)
         s["turn"] += 1
         cmd = command.strip().lower()
         text = "I don't understand that."

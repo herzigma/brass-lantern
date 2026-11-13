@@ -249,3 +249,149 @@ def test_start_session_retries_when_server_is_full(monkeypatch):
 
     obs = asyncio.run(go())
     assert obs.session_id == "sess-2" and sleeps == [2.0]
+
+
+def test_max_cost_stops_right_after_the_call_that_crosses_the_cap(tmp_path, fake, make_grue):
+    prov = CostlyProvider(cost=0.8)
+    summary = play(cfg_for(tmp_path, max_cost=0.5), make_grue(), prov)
+    assert prov.n == 1 and summary["stop_reason"] == "max_cost" and summary["status"] == "completed"
+    assert summary["totals"]["turns"] == 1 and fake.deleted == ["sess-1"]
+    sent = [b["command"] for m, p, b in fake.requests if p.endswith("/commands")]
+    assert sent == ["look"]  # the paid-for command went out; nothing after it
+
+
+def test_max_cost_does_not_mask_a_game_that_ended_on_that_turn(tmp_path, fake, make_grue):
+    summary = play(cfg_for(tmp_path, max_turns=1, max_cost=0.5), make_grue(), CostlyProvider(cost=1.0))
+    assert summary["stop_reason"] == "game_over" and summary["totals"]["ending"] == "turn_limit"
+
+
+def test_repair_call_failure_still_bills_the_first_call(tmp_path, fake, make_grue):
+    class Prose(Provider):
+        name = "prose"
+
+        def __init__(self):
+            super().__init__("prose")
+            self.n = 0
+
+        async def complete(self, system, messages):
+            self.n += 1
+            if self.n == 2:  # the format-repair follow-up
+                raise ProviderError("prose: HTTP 500 (gave up after 6 attempts)")
+            return Completion(text="Turns are limited, so I will make steady progress toward the chasm.",
+                              input_tokens=100, output_tokens=10, cost_usd=0.25, latency_s=1.0)
+
+    summary = play(cfg_for(tmp_path), make_grue(), Prose())
+    t = summary["totals"]
+    assert summary["stop_reason"] == "provider_error" and summary["status"] == "error"
+    assert t["turns"] == 0 and t["input_tokens"] == 100 and t["output_tokens"] == 10
+    assert t["cost_usd"] == pytest.approx(0.25) and t["parse_failures"] == 0
+    assert fake.deleted == ["sess-1"]
+
+
+def test_repair_call_failure_bills_via_price_table_too(tmp_path, fake, make_grue):
+    class Prose(CostlyProvider):
+        async def complete(self, system, messages):
+            self.n += 1
+            if self.n == 2:
+                raise ProviderError("boom")
+            return Completion(text="Long prose with no command, so we go on and on and on and on.",
+                              input_tokens=1_000_000, output_tokens=0)
+
+    summary = play(cfg_for(tmp_path, price=(2.0, 4.0)), make_grue(), Prose(cost=None))
+    assert summary["totals"]["cost_usd"] == pytest.approx(2.0)
+
+
+def test_model_calls_are_capped_when_the_server_never_advances_turns(tmp_path, fake, make_grue):
+    fake.stall_after_turn = 1  # after one real turn every command comes back "not sent", turn stays at 1
+    prov = CostlyProvider(cost=0.0)
+    summary = play(cfg_for(tmp_path, max_turns=4), make_grue(), prov)
+    assert summary["stop_reason"] == "max_calls" and summary["status"] == "completed"
+    assert prov.n == 12 and summary["totals"]["turns"] == 12  # 3 * max_turns
+    assert fake.sessions["sess-1"]["turn"] == 1 and fake.deleted == ["sess-1"]
+    assert summary["totals"]["ending"] == "aborted"
+
+
+def test_normal_runs_are_not_hit_by_the_call_cap(tmp_path, fake, make_grue):
+    summary = play(cfg_for(tmp_path, max_turns=5), make_grue(), ScriptedProvider(["north"]))
+    assert summary["stop_reason"] == "game_over" and summary["totals"]["ending"] == "turn_limit"
+
+
+def test_grue_client_uses_short_keepalive_expiry():
+    from brass_lantern.grue_client import KEEPALIVE_EXPIRY_S
+
+    g = GrueClient("http://grue.test")  # real transport, nothing is sent
+    assert KEEPALIVE_EXPIRY_S == 2.0 and g._http._transport._pool._keepalive_expiry == 2.0
+
+
+def _flaky_transport(fail_first, exc=None):
+    import httpx
+
+    calls = []
+
+    def handler(request):
+        calls.append(request.method)
+        if len(calls) <= fail_first:
+            raise exc or httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return httpx.Response(200, json={"status": "ok", "session_id": "s", "turn": 1, "text": "t"})
+
+    return httpx.MockTransport(handler), calls
+
+
+def test_idempotent_requests_retry_once_on_a_stale_connection():
+    import httpx
+
+    for exc in (None, httpx.ConnectError("reset")):
+        transport, calls = _flaky_transport(1, exc)
+
+        async def go():
+            async with GrueClient("http://grue.test", transport=transport) as g:
+                return await g.health()
+
+        assert asyncio.run(go())["status"] == "ok" and calls == ["GET", "GET"]
+
+    transport, calls = _flaky_transport(1)
+
+    async def delete():
+        async with GrueClient("http://grue.test", transport=transport) as g:
+            return await g.end_session("s")
+
+    assert asyncio.run(delete()).session_id == "s" and calls == ["DELETE", "DELETE"]
+
+    transport, calls = _flaky_transport(2)  # a second failure is reported, not retried again
+
+    async def twice():
+        async with GrueClient("http://grue.test", transport=transport) as g:
+            await g.health()
+
+    with pytest.raises(GrueError, match="Cannot reach Grue"):
+        asyncio.run(twice())
+    assert calls == ["GET", "GET"]
+
+
+def test_command_post_is_never_retried_and_reported_as_grue_error(tmp_path, fake):
+    transport, calls = _flaky_transport(1)
+
+    async def go():
+        async with GrueClient("http://grue.test", transport=transport) as g:
+            await g.command("s", "north")
+
+    with pytest.raises(GrueError, match="not retried") as ei:
+        asyncio.run(go())
+    assert calls == ["POST"] and "POST /api/sessions/s/commands" in str(ei.value)
+
+    # end to end: the run is recorded as a grue_error with that message
+    import httpx
+    from fake_grue import FakeGrue
+
+    f = FakeGrue()
+    inner = f.transport()
+
+    def flaky(request):
+        if request.url.path.endswith("/commands"):
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return inner.handle_request(request)
+
+    grue = GrueClient("http://grue.test", transport=httpx.MockTransport(flaky))
+    summary = play(cfg_for(tmp_path), grue, CostlyProvider())
+    assert summary["status"] == "error" and summary["stop_reason"] == "grue_error"
+    assert "not retried" in summary["error"] and summary["totals"]["turns"] == 1

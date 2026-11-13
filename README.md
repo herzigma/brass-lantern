@@ -95,7 +95,7 @@ Each episode writes `runs/<run_id>/` (run ids look like `20261112-210000-zork1-o
 
 - `run.json`: config (including provider settings and the metadata sent to Grue), model, game, session id, status
   (`completed` | `interrupted` | `error`), stop reason (`game_over`, `max_turns`, `max_cost`, `max_time`,
-  `provider_error`, `grue_error`, `interrupted`, `error`), Grue's final `Result`, and totals: turns, score, max score,
+  `max_calls`, `provider_error`, `grue_error`, `interrupted`, `error`), Grue's final `Result`, and totals: turns, score, max score,
   ending, input/output tokens, cost, wall time, parse failures, invalid commands.
 - `transcript.jsonl`: one line per turn with the observation the model saw, the raw model reply, the command sent,
   parse method, tokens, cost, latency and finish reason; plus a final line with the last observation.
@@ -105,22 +105,49 @@ A bench also writes `leaderboard.md`, `results.csv` (one row per run) and `summa
 
 ## How scoring works
 
-- **Score** = the final in-game score Grue reports. **Normalized score** = score / max score (games without a max score
-  are left out of normalized rankings). The overall ranking averages each model's per-game mean normalized score, so every
-  game weighs the same regardless of repeat counts.
+- **Score** = the final in-game score Grue reports. **Normalized score** = score / max score. A finished run that never
+  reported a score but whose game has a max score counts as 0. Games without a max score are left out of normalized
+  rankings.
+- **Overall ranking** = the mean, over **all** games in the bench that have a max score, of the model's per-game mean
+  normalized score (each game weighs the same regardless of repeat counts). A game where the model has no valid run
+  counts as 0 and is marked `*` (and `- (=0)` in the per-game matrix), so a model cannot rank higher by failing on hard
+  games. The formula is repeated at the top of `leaderboard.md`.
+- **Valid runs** are those that count in the scores:
+  - completed runs, including ones stopped by `--max-turns`, `--max-cost`, `--max-time` or `max_calls`;
+  - runs that ended in `provider_error` after at least one turn: the model or provider failing is a real outcome, so they
+    are scored as reached and flagged in the **Errors** column (per model and per game; also `provider_errors` in
+    `summary.json`).
+- **Excluded runs** hit a harness problem (`grue_error`, `interrupted`, `error`, still `running`, or a `provider_error`
+  before the first turn). They are left out of scores, counted in the "excl." column and listed with their reason in the
+  "Excluded runs" section of `leaderboard.md` (and `excluded_reason` in `results.csv`). Their cost still counts.
+- **Configurations:** runs are grouped by model spec **and** the settings that change behaviour (temperature, history,
+  notes, reasoning, max tokens, max turns). If one spec was run with different settings, each configuration is its own
+  row, labelled with the settings that differ, e.g. `openrouter:x (notes, h=30)`. Identical configurations merge.
 - **Win rate** = share of runs Grue ended as `won`. Games often end by `turn_limit` instead, so score is the main signal.
 - **Invalid %** = parser rejections per command, as counted by Grue. **Format fail %** = replies without a `> COMMAND` line.
-- Runs that errored (API failure, server error) or were interrupted are excluded from scores and shown in the "excl."
-  count, but their cost still counts. Runs stopped by `--max-cost` or `--max-time` are scored as played.
 
 ## Cost controls
 
 - `--max-cost` (play) / `--max-cost-per-run` (bench) stop an episode when spend reaches the cap, then end the session.
+  The check runs before each model call and again right after a call that pushes spend over the cap, so no further turns
+  are sent; the stop reason is `max_cost`. A format-repair call that fails still bills the call that preceded it.
   OpenRouter reports real costs. Other providers report only tokens, so supply `--prices prices.json` to estimate cost
   (and make the cap work): `{"anthropic:claude-sonnet-4-5": {"input": 3.0, "output": 15.0}}` (USD per million tokens).
-  Without it a warning is printed and cost shows as `n/a`.
-- `--max-turns`, `--max-time` and `--history` bound the rest. Keep `--max-tokens` small unless you test reasoning models.
+- **`bench --max-cost-per-run` refuses to start** (exit code 2) if any model reports no dollar cost (anything except
+  `openrouter:`, `mock:`, `human:`) and has no entry in `--prices`: the cap would be silently inert, and spending without
+  an effective cap is the dangerous direction. The error names the models. `play --max-cost` only warns in that case, and
+  cost shows as `n/a`.
+- `--max-turns`, `--max-time` and `--history` bound the rest. Model calls are also capped at `3 * max-turns` per episode
+  (stop reason `max_calls`), in case Grue stops advancing `turn` (for example while it reports a command as not sent
+  because the game is still busy). Keep `--max-tokens` small unless you test reasoning models.
 - Use `mock:` for dry runs; they cost nothing.
+
+## Connection handling
+
+The Grue client drops idle pooled connections after 2 seconds (below the server's keep-alive) and retries a request once
+if the connection fails before any response arrives (`RemoteProtocolError` or `ConnectError`), but only for idempotent
+requests (`GET`, `DELETE`). `POST .../commands` is never retried because the command may already have run; such a failure
+ends the run as `grue_error` with a message saying so.
 
 ## Adding a provider
 

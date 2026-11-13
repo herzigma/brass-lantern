@@ -12,7 +12,14 @@ import httpx
 
 
 class ProviderError(Exception):
-    """An LLM call failed (after retries, where retrying made sense)."""
+    """An LLM call failed (after retries, where retrying made sense).
+
+    ``partial`` carries the :class:`Completion` of an earlier, successful call in the same
+    agent move (e.g. the first reply when its format-repair follow-up failed), so the
+    runner can still bill it.
+    """
+
+    partial: "Completion | None" = None
 
 
 class ConfigError(Exception):

@@ -10,6 +10,10 @@ from typing import Any
 import httpx
 
 DEFAULT_GRUE_URL = "http://localhost:8081"
+# Drop idle pooled connections after 2s, below Grue's server keep-alive timeout, so we do not
+# reuse a connection the server is about to close.
+KEEPALIVE_EXPIRY_S = 2.0
+IDEMPOTENT_METHODS = ("GET", "DELETE")
 
 
 class GrueError(Exception):
@@ -117,7 +121,8 @@ class GrueClient:
         api_key = api_key if api_key is not None else os.getenv("GRUE_API_KEY")
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self._http = httpx.AsyncClient(
-            base_url=self.base_url, headers=headers, timeout=timeout, transport=transport
+            base_url=self.base_url, headers=headers, timeout=timeout, transport=transport,
+            limits=httpx.Limits(keepalive_expiry=KEEPALIVE_EXPIRY_S),
         )
         self._sleep = sleep
 
@@ -132,14 +137,33 @@ class GrueClient:
 
     # -- low level ---------------------------------------------------------
 
+    def _unreachable(self, e: httpx.RequestError) -> GrueError:
+        return GrueError(
+            f"Cannot reach Grue at {self.base_url} ({type(e).__name__}: {e}). "
+            "Is the server running? Set GRUE_URL or --grue-url if it is elsewhere."
+        )
+
     async def _request(self, method: str, path: str, json: Any = None) -> dict[str, Any]:
-        try:
-            resp = await self._http.request(method, path, json=json)
-        except httpx.RequestError as e:
-            raise GrueError(
-                f"Cannot reach Grue at {self.base_url} ({type(e).__name__}: {e}). "
-                "Is the server running? Set GRUE_URL or --grue-url if it is elsewhere."
-            ) from e
+        idempotent = method in IDEMPOTENT_METHODS
+        attempt = 0
+        while True:
+            try:
+                resp = await self._http.request(method, path, json=json)
+                break
+            except (httpx.RemoteProtocolError, httpx.ConnectError) as e:
+                # A stale keep-alive connection (or a connect blip) fails before any response arrives.
+                # Safe to repeat once for idempotent requests; never for commands (they may have run).
+                if idempotent and attempt == 0:
+                    attempt += 1
+                    continue
+                if not idempotent and isinstance(e, httpx.RemoteProtocolError):
+                    raise GrueError(
+                        f"Grue closed the connection during {method} {path} ({type(e).__name__}: {e}). "
+                        "The request was not retried because it may already have been processed."
+                    ) from e
+                raise self._unreachable(e) from e
+            except httpx.RequestError as e:
+                raise self._unreachable(e) from e
         try:
             body = resp.json()
         except ValueError:

@@ -12,11 +12,12 @@ from fake_grue import WIN_SCRIPT
 
 
 def make_run(model, game, score, max_score, *, ending="turn_limit", turns=100, invalid=0, pf=0, cost=0.1,
-             status="completed", run_id=None):
+             status="completed", run_id=None, stop_reason=None, config=None):
     return {
         "run_id": run_id or f"{model}-{game}-{score}-{ending}-{status}",
-        "model": model, "game": game, "status": status, "stop_reason": "game_over",
-        "config": {"temperature": 0.7},
+        "model": model, "game": game, "status": status,
+        "stop_reason": stop_reason or ("game_over" if status == "completed" else status),
+        "config": config or {"temperature": 0.7},
         "totals": {"turns": turns, "score": score, "max_score": max_score, "max_score_reached": score,
                    "ending": ending, "input_tokens": 1000, "output_tokens": 100, "cost_usd": cost,
                    "parse_failures": pf, "invalid_commands": invalid},
@@ -32,7 +33,7 @@ RUNS = [
     make_run("B", "zork", 35, 350, invalid=0, turns=50, cost=0.05),
     make_run("B", "tiny", 5, 10, turns=20, cost=0.05),
     make_run("B", "zork", 340, 350, status="error", cost=0.5),
-    # model C: no cost info
+    # model C: no cost info, and never played zork (that game must count as 0 in its overall score)
     make_run("C", "tiny", 10, 10, ending="won", turns=6, cost=None),
 ]
 
@@ -52,8 +53,11 @@ def test_aggregate_math():
     assert b["overall"]["excluded_runs"] == 1 and b["overall"]["runs"] == 2
     assert b["games"]["zork"]["mean_score"] == 35
     assert b["overall"]["cost_usd"] == pytest.approx(0.6)
-    assert c["overall"]["cost_usd"] is None and c["overall"]["norm_score"] == 1.0
-    assert agg["ranking"] == ["C", "A", "B"]
+    assert c["overall"]["cost_usd"] is None and c["overall"]["norm_score"] == pytest.approx(0.5)
+    assert c["overall"]["missing_games"] == ["zork"] and a["overall"]["missing_games"] == []
+    assert b["overall"]["norm_score"] == pytest.approx((0.1 + 0.5) / 2)
+    assert agg["ranking"] == ["A", "C", "B"]
+    assert agg["excluded"] == [{"run_id": "B-zork-340-turn_limit-error", "model": "B", "game": "zork", "reason": "error"}]
     assert agg["games"] == ["tiny", "zork"]
 
 
@@ -73,11 +77,15 @@ def test_leaderboard_markdown():
     assert "## Overall ranking" in md and "## Mean score by game" in md and "## zork (max score 350)" in md
     rows = [ln for ln in md.splitlines() if ln.startswith("| ") and "`" in ln]
     overall = rows[:3]
-    assert overall[0].startswith("| 1 | `C`") and overall[1].startswith("| 2 | `A`") and overall[2].startswith("| 3 | `B`")
-    assert "71.4%" in overall[1]  # (150/350 + 1)/2 = 0.7142...
+    assert overall[0].startswith("| 1 | `A`") and overall[1].startswith("| 2 | `C`") and overall[2].startswith("| 3 | `B`")
+    assert "71.4%" in overall[0]  # (150/350 + 1)/2 = 0.7142...
+    assert r"50.0% \*" in overall[1] and "- (=0)" in md  # C: zork never played -> counted as 0, marked
     assert "150.0 (43%)" in md  # score matrix cell
     assert "2 (0)" not in md and "2 (1)" in overall[2]  # B: 2 counted runs, 1 excluded
-    assert "n/a" in overall[0]  # C has no cost
+    assert "n/a" in overall[1]  # C has no cost
+    assert "## Excluded runs" in md and "B-zork-340-turn_limit-error" in md
+    assert "mean over ALL games" in md  # the formula is documented at the top
+    assert md.index("Score formula") < md.index("## Overall ranking")
 
 
 def test_write_reports_and_report_cli(tmp_path, capsys):
@@ -95,7 +103,7 @@ def test_write_reports_and_report_cli(tmp_path, capsys):
     rows = list(csv.DictReader((tmp_path / "results.csv").open(encoding="utf-8")))
     assert len(rows) == len(RUNS) and {"model", "game", "score", "norm", "cost_usd", "ending"} <= set(rows[0])
     summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
-    assert summary["ranking"] == ["C", "A", "B"] and summary["n_runs"] == len(RUNS)
+    assert summary["ranking"] == ["A", "C", "B"] and summary["n_runs"] == len(RUNS)
     # regenerating twice is stable
     assert main(["report", str(tmp_path)]) == 0
 
@@ -188,3 +196,83 @@ def test_run_bench_interrupt_reports_partial(tmp_path, fake, make_grue):
     runs = load_runs(tmp_path)
     assert len(runs) == 2 and all(r["status"] == "interrupted" for r in runs)
     assert len(fake.deleted) == 2
+
+
+def test_completed_run_without_score_but_known_max_counts_as_zero():
+    runs = [make_run("A", "g", None, 10), make_run("A", "g", 10, 10, ending="won"), make_run("A", "h", None, None)]
+    agg = aggregate(runs)
+    g = agg["models"]["A"]["games"]["g"]
+    assert g["mean_score"] == 5 and g["mean_norm"] == pytest.approx(0.5) and g["runs"] == 2
+    assert "h" in agg["models"]["A"]["games"] and agg["models"]["A"]["games"]["h"]["mean_score"] is None  # no max: stays unknown
+    assert agg["rows"][0]["score"] == 0 and agg["rows"][0]["norm"] == 0.0
+
+
+def test_provider_error_runs_count_if_played_and_are_flagged_harness_errors_are_excluded():
+    runs = [
+        make_run("A", "g", 6, 10, status="error", stop_reason="provider_error", turns=7, run_id="pe-played"),
+        make_run("A", "g", 0, 10, status="error", stop_reason="provider_error", turns=0, run_id="pe-none"),
+        make_run("A", "g", 9, 10, status="error", stop_reason="grue_error", run_id="grue"),
+        make_run("A", "g", 9, 10, status="interrupted", stop_reason="interrupted", run_id="intr"),
+        make_run("A", "g", 9, 10, status="error", stop_reason="error", run_id="boom"),
+        make_run("A", "g", 4, 10, run_id="ok"),
+    ]
+    agg = aggregate(runs)
+    o, g = agg["models"]["A"]["overall"], agg["models"]["A"]["games"]["g"]
+    assert o["runs"] == 2 and o["excluded_runs"] == 4 and o["provider_errors"] == 1 and g["provider_errors"] == 1
+    assert g["mean_score"] == 5  # (6 + 4) / 2: the provider-error run counts at the score it reached
+    reasons = {e["run_id"]: e["reason"] for e in agg["excluded"]}
+    assert reasons == {"pe-none": "provider_error (no turns played)", "grue": "grue_error",
+                       "intr": "interrupted", "boom": "error"}
+    md = render_leaderboard(agg)
+    assert "| Errors |" in md and "## Excluded runs" in md
+    assert "| grue |" in md and "grue_error" in md and "pe-played" not in md
+    overall_row = next(ln for ln in md.splitlines() if ln.startswith("| 1 |"))
+    assert overall_row.endswith("| 2 (4) | 1 |")
+    # no exclusions -> no section
+    assert "## Excluded runs" not in render_leaderboard(aggregate([make_run("A", "g", 1, 10)]))
+
+
+def test_overall_ranking_averages_over_all_games_so_failing_hard_games_cannot_help():
+    runs = [
+        # X aces the easy game and never gets a valid run on the hard one; Y is decent on both.
+        make_run("X", "easy", 10, 10, ending="won"),
+        make_run("X", "hard", 3, 100, status="error", stop_reason="grue_error"),
+        make_run("Y", "easy", 6, 10),
+        make_run("Y", "hard", 70, 100),
+    ]
+    agg = aggregate(runs)
+    x, y = agg["models"]["X"]["overall"], agg["models"]["Y"]["overall"]
+    assert x["norm_score"] == pytest.approx(0.5) and x["missing_games"] == ["hard"]
+    assert y["norm_score"] == pytest.approx(0.65) and y["missing_games"] == []
+    assert agg["ranking"] == ["Y", "X"]
+
+
+def test_config_variants_are_separate_rows_and_identical_configs_merge():
+    base = {"temperature": 0.7, "history": 30, "notes": False, "reasoning": None, "max_tokens": 1024, "max_turns": 150}
+    runs = [
+        make_run("m", "g", 2, 10, config=base, run_id="a"),
+        make_run("m", "g", 4, 10, config=dict(base), run_id="b"),  # same config: merges with "a"
+        make_run("m", "g", 8, 10, config={**base, "notes": True}, run_id="c"),
+        make_run("m", "g", 6, 10, config={**base, "notes": True, "history": 10}, run_id="d"),
+        make_run("solo", "g", 5, 10, config=base, run_id="e"),
+    ]
+    agg = aggregate(runs)
+    assert set(agg["models"]) == {"m (no notes, h=30)", "m (notes, h=30)", "m (notes, h=10)", "solo"}
+    plain = agg["models"]["m (no notes, h=30)"]
+    assert plain["overall"]["runs"] == 2 and plain["overall"]["norm_score"] == pytest.approx(0.3) and plain["spec"] == "m"
+    assert agg["models"]["m (notes, h=30)"]["config"]["notes"] is True
+    assert {r["run_id"]: r["variant"] for r in agg["rows"]}["c"] == "m (notes, h=30)"
+    assert agg["ranking"][0] == "m (notes, h=30)"
+    md = render_leaderboard(agg)
+    assert "`m (notes, h=10)`" in md and "`solo`" in md  # a single-config spec keeps its plain name
+    # only temperature differs: that is what the label shows
+    t = aggregate([make_run("m", "g", 1, 10, config={**base, "temperature": None}), make_run("m", "g", 1, 10, config=base)])
+    assert set(t["models"]) == {"m (t=none)", "m (t=0.7)"}
+
+
+def test_write_reports_csv_has_variant_and_exclusion_columns(tmp_path):
+    write_reports(tmp_path, RUNS)
+    rows = list(csv.DictReader((tmp_path / "results.csv").open(encoding="utf-8")))
+    assert {"variant", "counted", "excluded_reason", "notes", "history"} <= set(rows[0])
+    bad = next(r for r in rows if r["status"] == "error")
+    assert bad["counted"] == "False" and bad["excluded_reason"] == "error"

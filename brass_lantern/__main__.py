@@ -16,7 +16,7 @@ from brass_lantern import __version__
 from brass_lantern.bench import BenchConfig, load_runs, render_leaderboard, run_bench, write_reports
 from brass_lantern.console import setup_stdio
 from brass_lantern.grue_client import GrueClient, GrueError
-from brass_lantern.providers import ConfigError, create_provider
+from brass_lantern.providers import ConfigError, create_provider, split_spec
 from brass_lantern.runner import RunConfig, play_episode
 
 EPILOG = """\
@@ -66,6 +66,14 @@ def load_prices(path: str | None) -> dict[str, tuple[float, float]]:
         return out
     except (OSError, ValueError, KeyError, TypeError) as e:
         raise ConfigError(f"Cannot read prices file {path!r}: {e}") from e
+
+
+COST_REPORTING_PROVIDERS = ("openrouter", "mock", "human")  # providers whose cap works without --prices
+
+
+def uncapped_models(models: Sequence[str], prices: dict[str, tuple[float, float]]) -> list[str]:
+    """Specs for which a dollar cap cannot work: no provider-reported cost and no --prices entry."""
+    return [m for m in models if split_spec(m)[0] not in COST_REPORTING_PROVIDERS and m not in prices]
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
@@ -163,6 +171,12 @@ async def _play(args: argparse.Namespace) -> int:
 
 
 async def _bench(args: argparse.Namespace) -> int:
+    prices = load_prices(args.prices)
+    if args.max_cost_per_run is not None and (bad := uncapped_models(args.models, prices)):
+        raise ConfigError(  # spending without an effective cap is the dangerous direction: refuse to start
+            f"--max-cost-per-run cannot be enforced for {', '.join(bad)}: the provider reports no dollar cost "
+            "and --prices has no entry for it. Add the model to a --prices file, or drop --max-cost-per-run."
+        )
     out = Path(args.out) if args.out else Path("runs") / f"bench-{datetime.now():%Y%m%d-%H%M%S}"
     async with GrueClient(args.grue_url) as grue:
         games = args.games
@@ -172,7 +186,7 @@ async def _bench(args: argparse.Namespace) -> int:
             models=args.models, games=games, runs=args.runs, max_turns=args.max_turns, concurrency=args.concurrency,
             max_cost_per_run=args.max_cost_per_run, max_time_per_run=args.max_time_per_run, history=args.history,
             notes=args.notes, temperature=args.temperature, max_tokens=args.max_tokens, base_url=args.base_url,
-            reasoning=args.reasoning, grue_url=args.grue_url, out_dir=out, prices=load_prices(args.prices),
+            reasoning=args.reasoning, grue_url=args.grue_url, out_dir=out, prices=prices,
         )
         total = len(cfg.models) * len(cfg.games) * cfg.runs
         print(f"bench: {len(cfg.models)} models x {len(cfg.games)} games x {cfg.runs} runs = {total} episodes "

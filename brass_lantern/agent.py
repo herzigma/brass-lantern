@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 
 from brass_lantern.grue_client import Observation
-from brass_lantern.providers import Completion, Provider
+from brass_lantern.providers import Completion, Provider, ProviderError
 
 MAX_COMMAND_CHARS = 120
 MAX_NOTES_CHARS = 1500
@@ -309,7 +309,11 @@ class Agent:
                 {"role": "assistant", "content": completion.text or "(empty reply)"},
                 {"role": "user", "content": REPAIR_PROMPT},
             ]
-            fix = await self.provider.complete(self.system_prompt, repair_messages)
+            try:
+                fix = await self.provider.complete(self.system_prompt, repair_messages)
+            except ProviderError as e:
+                e.partial = completion  # the first call was paid for; let the runner bill it
+                raise
             fixed = parse_command(fix.text)
             completion = _merge(completion, fix)
             if fixed.command and not looks_like_prose(fixed.command):

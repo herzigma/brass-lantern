@@ -138,3 +138,28 @@ def test_decision_command_and_fallbacks():
     assert d.command == "return"
     d = act(a, obs())
     assert d.command == "take lamp"
+
+
+def test_repair_failure_attaches_the_first_completion_to_the_error():
+    import pytest
+
+    from brass_lantern.providers.base import ProviderError
+
+    class Flaky(FakeProvider):
+        async def complete(self, system, messages):
+            self.calls.append((system, messages))
+            if len(self.calls) == 2:
+                raise ProviderError("repair failed")
+            return Completion(text="Plenty of prose here, but no command line at all, sorry.", input_tokens=7, cost_usd=0.5)
+
+    with pytest.raises(ProviderError) as ei:
+        act(Agent(Flaky([])), obs())
+    assert ei.value.partial is not None and ei.value.partial.input_tokens == 7 and ei.value.partial.cost_usd == 0.5
+
+    class FirstFails(FakeProvider):
+        async def complete(self, system, messages):
+            raise ProviderError("first failed")
+
+    with pytest.raises(ProviderError) as ei:
+        act(Agent(FirstFails([])), obs())
+    assert ei.value.partial is None

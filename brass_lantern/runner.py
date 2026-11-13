@@ -16,7 +16,11 @@ from brass_lantern import __version__
 from brass_lantern.agent import Agent
 from brass_lantern.console import Reporter
 from brass_lantern.grue_client import GrueClient, GrueError, Observation, Result
-from brass_lantern.providers import Provider, ProviderError
+from brass_lantern.providers import Completion, Provider, ProviderError
+
+
+# Model calls per episode are capped at this multiple of max_turns, in case the server stops advancing turns.
+MAX_CALLS_FACTOR = 3
 
 
 @dataclass
@@ -160,6 +164,19 @@ async def play_episode(
             "result": result.raw if result else None,
         }
 
+    def bill(comp: Completion) -> float | None:
+        """Add one model reply's tokens, time and cost (price table if the provider gave none)."""
+        cost = comp.cost_usd
+        if cost is None and cfg.price:
+            cost = (comp.input_tokens * cfg.price[0] + comp.output_tokens * cfg.price[1]) / 1e6
+        totals.input_tokens += comp.input_tokens
+        totals.output_tokens += comp.output_tokens
+        totals.model_time += comp.latency_s
+        if cost is not None:
+            totals.cost += cost
+            totals.cost_known = True
+        return cost
+
     def write_run_json(final: bool) -> dict[str, Any]:
         summary = build_summary(final)
         (run_dir / "run.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -184,6 +201,10 @@ async def play_episode(
                 if obs.turn >= cfg.max_turns:
                     stop_reason = "max_turns"
                     break
+                if totals.turns >= MAX_CALLS_FACTOR * cfg.max_turns:
+                    # Grue did not advance `turn` (e.g. "command was not sent" notices): bound the model calls.
+                    stop_reason = "max_calls"
+                    break
                 if cfg.max_cost is not None and totals.cost >= cfg.max_cost:
                     stop_reason = "max_cost"
                     break
@@ -194,20 +215,14 @@ async def play_episode(
                 try:
                     decision = await agent.act(obs)
                 except ProviderError as e:
+                    if e.partial is not None:  # an earlier call of this move succeeded and was billed
+                        bill(e.partial)
                     stop_reason, status, error = "provider_error", "error", str(e)
                     break
 
                 comp = decision.completion
-                cost = comp.cost_usd
-                if cost is None and cfg.price:
-                    cost = (comp.input_tokens * cfg.price[0] + comp.output_tokens * cfg.price[1]) / 1e6
+                cost = bill(comp)
                 totals.turns += 1
-                totals.input_tokens += comp.input_tokens
-                totals.output_tokens += comp.output_tokens
-                totals.model_time += comp.latency_s
-                if cost is not None:
-                    totals.cost += cost
-                    totals.cost_known = True
                 if not decision.parsed.ok:
                     totals.parse_failures += 1
 
@@ -246,6 +261,9 @@ async def play_episode(
                     if not obs.game_over:
                         obs.game_over = True
                 reporter.observation(obs.text)
+                if not obs.game_over and cfg.max_cost is not None and totals.cost >= cfg.max_cost:
+                    stop_reason = "max_cost"  # this call pushed spend over the cap: send nothing further
+                    break
 
             if obs.game_over:
                 log({"turn": obs.turn, "ts": now_iso(), "final": True, "observation": _obs_dict(obs)})
