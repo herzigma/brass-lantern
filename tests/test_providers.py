@@ -241,7 +241,7 @@ def test_anthropic_request_shape_system_split():
         {"role": "assistant", "content": "> look"},
         {"role": "user", "content": "two"},
     ]
-    p, seen, _ = make("anthropic:claude-x", [ANTHROPIC_OK], env={"ANTHROPIC_API_KEY": "sk-a"})
+    p, seen, _ = make("anthropic:claude-x", [ANTHROPIC_OK], env={"ANTHROPIC_API_KEY": "sk-a"}, cache=False)
     c = run(p.complete(SYSTEM, msgs))
     req = seen[0]
     body = json.loads(req.content)
@@ -268,7 +268,7 @@ def test_anthropic_base_url_override_via_argument_only():
 
 def test_anthropic_merges_consecutive_same_role():
     msgs = [{"role": "user", "content": "a"}, {"role": "user", "content": "b"}]
-    p, seen, _ = make("anthropic:claude-x", [ANTHROPIC_OK], env={"ANTHROPIC_API_KEY": "k"})
+    p, seen, _ = make("anthropic:claude-x", [ANTHROPIC_OK], env={"ANTHROPIC_API_KEY": "k"}, cache=False)
     run(p.complete(SYSTEM, msgs))
     assert json.loads(seen[0].content)["messages"] == [{"role": "user", "content": "a\n\nb"}]
 

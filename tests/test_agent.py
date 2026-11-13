@@ -59,7 +59,7 @@ def test_char_mode_warning_and_notice():
 
 def test_history_trimming_keeps_last_n_turns_verbatim():
     p = FakeProvider([f"> cmd{i}" for i in range(10)])
-    a = Agent(p, history=3)
+    a = Agent(p, history=3, cache=False)  # the sliding window (--cache off)
     for i in range(6):
         act(a, obs(turn=i, text=f"text {i}"))
     msgs = p.calls[-1][1]

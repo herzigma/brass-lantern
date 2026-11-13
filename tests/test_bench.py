@@ -4,8 +4,13 @@ import json
 
 import pytest
 
+import brass_lantern.__main__ as cli
 from brass_lantern.__main__ import main
-from brass_lantern.bench import BenchConfig, aggregate, load_runs, render_leaderboard, run_bench, write_reports
+from brass_lantern.bench import (
+    BenchConfig, aggregate, config_from_bench_json, load_runs, plan_resume, render_leaderboard, run_bench,
+    write_reports,
+)
+from brass_lantern.grue_client import GrueClient
 from brass_lantern.providers import ConfigError
 from brass_lantern.providers.scripted import ScriptedProvider
 from fake_grue import WIN_SCRIPT
@@ -276,3 +281,198 @@ def test_write_reports_csv_has_variant_and_exclusion_columns(tmp_path):
     assert {"variant", "counted", "excluded_reason", "notes", "history"} <= set(rows[0])
     bad = next(r for r in rows if r["status"] == "error")
     assert bad["counted"] == "False" and bad["excluded_reason"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# bench.json and --resume
+# ---------------------------------------------------------------------------
+
+
+def test_run_bench_writes_bench_json_and_it_round_trips(tmp_path, fake, make_grue):
+    cfg = BenchConfig(models=["mock:win"], games=["tiny"], runs=1, max_turns=6, notes=True, temperature=None,
+                      max_cost_per_run=0.5, max_time_per_run=60.0, grue_url="http://g", out_dir=tmp_path / "b",
+                      prices={"mock:win": (1.0, 2.5)})
+    asyncio.run(run_bench(cfg, grue=make_grue(), provider_factory=scripted_factory({"mock:win": WIN_SCRIPT}),
+                          log=lambda s: None))
+    data = json.loads((cfg.out_dir / "bench.json").read_text(encoding="utf-8"))
+    assert data["version"] == 1 and data["created_at"] and data["brass_lantern_version"]
+    for key in ("models", "games", "runs", "max_turns", "max_cost_per_run", "max_time_per_run", "history", "notes",
+                "temperature", "max_tokens", "reasoning", "base_url", "grue_url"):
+        assert key in data
+    assert data["models"] == ["mock:win"] and data["temperature"] is None and data["prices"] == {"mock:win": [1.0, 2.5]}
+    assert "out_dir" not in data
+    assert config_from_bench_json(data, cfg.out_dir) == cfg  # tuples and paths come back as they went in
+
+
+def test_bench_json_loader_ignores_unknown_keys_and_defaults_missing_ones(tmp_path):
+    cfg = config_from_bench_json({"version": 1, "models": ["m"], "games": ["g"], "future_option": 1}, tmp_path)
+    assert cfg == BenchConfig(models=["m"], games=["g"], out_dir=tmp_path)
+    with pytest.raises(ConfigError, match="no models"):
+        config_from_bench_json({"version": 1, "games": ["g"]}, tmp_path)
+
+
+def test_plan_resume_uses_the_aggregation_rule_and_repeat_numbers():
+    def run(game, repeat, **kw):
+        r = make_run("m", game, 1, 10, **kw)
+        if repeat:
+            r["config"] = {"meta": {"repeat": repeat}}
+        return r
+
+    cfg = BenchConfig(models=["m"], games=["g", "h"], runs=3)
+    runs = [
+        run("g", 1),                                                          # counts
+        run("g", 2, status="interrupted"),                                    # rerun
+        run("g", 3, status="error", stop_reason="provider_error", turns=5),   # played a turn: counts
+        run("h", 1, status="error", stop_reason="provider_error", turns=0),   # no turns played: rerun
+        run("h", 2, status="running"),                                        # rerun
+        run("h", 3, status="error", stop_reason="grue_error"),                # rerun
+        run("other", 1),                                                      # not part of this bench
+    ]
+    jobs, total = plan_resume(cfg, runs)
+    # same order as a fresh bench: repeats interleaved
+    assert total == 6 and jobs == [(0, "h", "m"), (1, "g", "m"), (1, "h", "m"), (2, "h", "m")]
+
+    # runs with no repeat number (older run.json files) fill the lowest free slots of their cell
+    legacy = [run("g", None), run("g", None), run("g", 3)]
+    assert plan_resume(BenchConfig(models=["m"], games=["g"], runs=4), legacy)[0] == [(3, "g", "m")]
+    # a bigger --runs only adds the new repeats
+    assert plan_resume(BenchConfig(models=["m"], games=["g"], runs=5), [run("g", 1), run("g", 2)])[0] == [
+        (2, "g", "m"), (3, "g", "m"), (4, "g", "m")]
+
+
+@pytest.fixture
+def patched_grue(monkeypatch, fake):
+    class TestGrue(GrueClient):
+        def __init__(self, base_url=None, *a, **kw):
+            super().__init__(base_url or "http://grue.test", transport=fake.transport())
+
+    monkeypatch.setattr(cli, "GrueClient", TestGrue)
+    return fake
+
+
+def sessions_started(fake):
+    return sum((m, p) == ("POST", "/api/sessions") for m, p, _ in fake.requests)
+
+
+def edit_run(out, script, repeat, **changes):
+    for path in out.glob("*/run.json"):
+        r = json.loads(path.read_text(encoding="utf-8"))
+        if r["model"].endswith(script) and r["config"]["meta"]["repeat"] == repeat:
+            r.update(changes)
+            path.write_text(json.dumps(r), encoding="utf-8")
+            return
+    raise AssertionError(f"no run for {script} #{repeat}")
+
+
+@pytest.fixture
+def scripts(tmp_path):
+    (tmp_path / "win.txt").write_text("\n".join(WIN_SCRIPT), encoding="utf-8")
+    (tmp_path / "idle.txt").write_text("north\n", encoding="utf-8")
+    return f"mock:{tmp_path / 'win.txt'},mock:{tmp_path / 'idle.txt'}"
+
+
+def test_resume_skips_finished_episodes_and_reruns_failed_ones(patched_grue, tmp_path, scripts, capsys):
+    out = tmp_path / "b"
+    assert cli.main(["bench", "--models", scripts, "--games", "tiny", "--runs", "2", "--max-turns", "6",
+                     "--history", "7", "--concurrency", "2", "--out", str(out)]) == 0
+    assert sessions_started(patched_grue) == 4 and (out / "bench.json").exists()
+    capsys.readouterr()
+
+    edit_run(out, "win.txt", 1, status="interrupted", stop_reason="interrupted")
+    edit_run(out, "win.txt", 2, status="running", stop_reason=None)
+    edit_run(out, "idle.txt", 1, status="error", stop_reason="grue_error")
+    edit_run(out, "idle.txt", 2, status="error", stop_reason="provider_error")  # played turns: stays done
+    (out / "leaderboard.md").unlink()
+
+    assert cli.main(["bench", "--resume", str(out)]) == 0
+    text = capsys.readouterr().out
+    assert f"Resuming {out}: 1 of 4 episodes already done, running 3." in text
+    assert sessions_started(patched_grue) == 4 + 3
+    assert (out / "leaderboard.md").exists()
+
+    # the old failed dirs stay; the leaderboard counts each cell exactly once per repeat
+    assert len(list(out.glob("*/run.json"))) == 7
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert summary["n_runs"] == 7 and len(summary["excluded"]) == 3
+    for model in summary["models"].values():
+        assert model["overall"]["runs"] == 2 and model["games"]["tiny"]["runs"] == 2
+    configs = {r["run_id"]: r["config"] for r in load_runs(out)}
+    for spec in scripts.split(","):
+        repeats = sorted(configs[r["run_id"]]["meta"]["repeat"] for r in summary["rows"]
+                         if r["counted"] and r["model"] == spec)
+        assert repeats == [1, 2]
+    # reruns used the saved configuration, not the CLI defaults
+    assert all(c["max_turns"] == 6 and c["history"] == 7 for c in configs.values())
+
+    # a second resume has nothing left to do and just rewrites the reports
+    (out / "results.csv").unlink()
+    assert cli.main(["bench", "--resume", str(out)]) == 0
+    assert "4 of 4 episodes already done, nothing to run." in capsys.readouterr().out
+    assert sessions_started(patched_grue) == 7 and (out / "results.csv").exists()
+    resumes = json.loads((out / "bench.json").read_text(encoding="utf-8"))["resumes"]
+    assert [(r["done"], r["running"]) for r in resumes] == [(1, 3), (4, 0)] and resumes[0]["at"]
+
+
+def test_resume_can_raise_runs_and_override_limits(patched_grue, tmp_path, scripts, capsys):
+    out = tmp_path / "b"
+    win = scripts.split(",")[0]
+    assert cli.main(["bench", "--models", win, "--games", "tiny", "--runs", "1", "--out", str(out)]) == 0
+    capsys.readouterr()
+    assert cli.main(["bench", "--resume", str(out), "--runs", "3", "--concurrency", "1", "--max-time-per-run", "30"]) == 0
+    assert "1 of 3 episodes already done, running 2." in capsys.readouterr().out
+    assert sessions_started(patched_grue) == 3
+    data = json.loads((out / "bench.json").read_text(encoding="utf-8"))
+    assert data["runs"] == 3 and data["concurrency"] == 1 and data["max_time_per_run"] == 30
+    assert data["resumes"][0]["overrides"] == {"runs": 3, "concurrency": 1, "max_time_per_run": 30.0}
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert summary["models"][win]["games"]["tiny"]["runs"] == 3 and summary["excluded"] == []
+    # raising --runs adds repeats 2 and 3, it does not replay repeat 1
+    assert sorted(r["config"]["meta"]["repeat"] for r in load_runs(out)) == [1, 2, 3]
+
+    # lowering it is an error, and nothing runs
+    assert cli.main(["bench", "--resume", str(out), "--runs", "2"]) == 2
+    assert "--runs 2 is lower than the 3" in capsys.readouterr().err
+    assert sessions_started(patched_grue) == 3
+
+
+def test_resume_errors_are_clean(patched_grue, tmp_path, capsys):
+    assert cli.main(["bench", "--resume", str(tmp_path / "nope")]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:") and "not a directory" in err and "Traceback" not in err
+    old = tmp_path / "old-bench"
+    old.mkdir()
+    assert cli.main(["bench", "--resume", str(old)]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:") and "no bench.json" in err and "Traceback" not in err
+    (old / "bench.json").write_text("{oops", encoding="utf-8")
+    assert cli.main(["bench", "--resume", str(old)]) == 2 and "Cannot read" in capsys.readouterr().err
+    (old / "bench.json").write_text(json.dumps({"version": 99, "models": ["m"], "games": ["g"]}), encoding="utf-8")
+    assert cli.main(["bench", "--resume", str(old)]) == 2 and "format version 99" in capsys.readouterr().err
+    assert sessions_started(patched_grue) == 0
+
+
+@pytest.mark.parametrize("extra", [["--models", "a"], ["--games", "tiny"], ["--out", "x"], ["--notes"], ["--max-turns", "9"]])
+def test_resume_rejects_options_that_come_from_bench_json(extra, capsys):
+    with pytest.raises(SystemExit) as e:
+        cli.main(["bench", "--resume", "somewhere", *extra])
+    assert e.value.code == 2
+    err = capsys.readouterr().err
+    assert "--resume" in err and "bench.json" in err and extra[0] in err
+
+
+@pytest.mark.parametrize("args", [[], ["--models", "a"], ["--games", "tiny"]])
+def test_bench_still_needs_models_and_games_without_resume(args, capsys):
+    with pytest.raises(SystemExit) as e:
+        cli.main(["bench", *args])
+    assert e.value.code == 2 and "required" in capsys.readouterr().err
+
+
+def test_resume_help_and_interrupted_message_show_the_command(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["bench", "--help"])
+    assert "brass-lantern bench --resume runs/bench-" in " ".join(capsys.readouterr().out.split())
+    d = tmp_path / "with space"
+    d.mkdir()
+    assert cli._finish_bench(d, interrupted=True) == 130
+    assert f'brass-lantern bench --resume "{d}"' in capsys.readouterr().err
+    assert cli._finish_bench(d, interrupted=False) == 0 and "--resume" not in capsys.readouterr().err

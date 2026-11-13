@@ -50,6 +50,7 @@ def create_provider(
     temperature: float | None = 0.7,
     max_tokens: int = 1024,
     reasoning: str | None = None,
+    cache: bool = True,
     env: Mapping[str, str] | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     sleep: Any = None,
@@ -58,7 +59,8 @@ def create_provider(
 
     ``base_url`` overrides the provider's endpoint (this is how ``openai:`` talks to
     vLLM / LM Studio / Together). ``env`` defaults to ``os.environ``. Note that
-    ANTHROPIC_BASE_URL is deliberately never read.
+    ANTHROPIC_BASE_URL is deliberately never read. ``cache`` turns on the request hints that
+    enable prompt caching (Anthropic, and Anthropic models via OpenRouter).
     """
     env = os.environ if env is None else env
     provider, model = split_spec(spec)
@@ -67,15 +69,17 @@ def create_provider(
         from brass_lantern.providers.scripted import ScriptedProvider
 
         try:
-            return ScriptedProvider.from_file(model, temperature=temperature, max_tokens=max_tokens)
+            return ScriptedProvider.from_file(model, temperature=temperature, max_tokens=max_tokens, cache=cache)
         except OSError as e:
             raise ConfigError(f"Cannot read mock script {model!r}: {e}") from e
     if provider == "human":
         from brass_lantern.providers.scripted import HumanProvider
 
-        return HumanProvider(model, temperature=temperature, max_tokens=max_tokens)
+        return HumanProvider(model, temperature=temperature, max_tokens=max_tokens, cache=cache)
 
-    common: dict[str, Any] = {"temperature": temperature, "max_tokens": max_tokens, "transport": transport}
+    common: dict[str, Any] = {
+        "temperature": temperature, "max_tokens": max_tokens, "cache": cache, "transport": transport,
+    }
     if sleep is not None:
         common["sleep"] = sleep
 

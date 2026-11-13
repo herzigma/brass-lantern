@@ -13,7 +13,10 @@ from typing import Sequence
 from dotenv import find_dotenv, load_dotenv
 
 from brass_lantern import __version__
-from brass_lantern.bench import BenchConfig, load_runs, render_leaderboard, run_bench, write_reports
+from brass_lantern.bench import (
+    BenchConfig, bench_fields, config_from_bench_json, load_runs, now_utc, plan_resume, read_bench_json,
+    render_leaderboard, run_bench, write_bench_json, write_reports,
+)
 from brass_lantern.console import setup_stdio
 from brass_lantern.grue_client import GrueClient, GrueError
 from brass_lantern.providers import ConfigError, create_provider, split_spec
@@ -82,6 +85,13 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help="turn limit per episode (default: the game's suggested limit from the catalog)")
     p.add_argument("--history", type=int, default=30, help="recent turns kept verbatim in context (default: 30)")
     p.add_argument("--notes", action="store_true", help="give the model a NOTES: scratchpad that persists across turns")
+    p.add_argument("--cache", choices=["on", "off"], default="on",
+                   help="prompt caching (default: on): the history window advances in steps of 10 turns so "
+                        "provider caches can hit, and Anthropic models get cache_control hints; 'off' slides "
+                        "the window one turn at a time, as in older runs")
+    p.add_argument("--format", choices=["text", "tools"], default="text",
+                   help="how the model answers (default: text, a final '> COMMAND' line); 'tools' makes it call "
+                        "a native 'act' tool instead, separating playing ability from format-following")
     p.add_argument("--temperature", type=_temperature, default=0.7,
                    help="sampling temperature (default: 0.7); 'none' omits it, for models that reject it")
     p.add_argument("--max-tokens", type=int, default=1024, help="max output tokens per reply (default: 1024)")
@@ -120,10 +130,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     b = sub.add_parser("bench", help="run a models x games x repeats matrix and write a leaderboard",
                        epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
-    b.add_argument("--models", required=True, type=_csv, help="comma-separated provider:model specs")
-    b.add_argument("--games", required=True, type=_csv, help="comma-separated game ids, or 'all' for every available game")
-    b.add_argument("--runs", type=int, default=3, help="repeats per model/game cell (default: 3)")
-    b.add_argument("--concurrency", type=int, default=4, help="episodes run in parallel (default: 4)")
+    b.add_argument("--models", type=_csv, help="comma-separated provider:model specs (required unless --resume)")
+    b.add_argument("--games", type=_csv,
+                   help="comma-separated game ids, or 'all' for every available game (required unless --resume)")
+    b.add_argument("--resume", metavar="DIR",
+                   help="continue an interrupted bench: read DIR/bench.json, run only the episodes that did not finish "
+                        "(error, interrupted, still running), then rewrite the reports. Only --runs (raise it to add "
+                        "repeats), --concurrency, --max-cost-per-run, --max-time-per-run, --grue-url and --prices can "
+                        "be changed. Example: brass-lantern bench --resume runs/bench-20261112-210000")
+    b.add_argument("--runs", type=int, default=None, help="repeats per model/game cell (default: 3)")
+    b.add_argument("--concurrency", type=int, default=None, help="episodes run in parallel (default: 4)")
     b.add_argument("--max-cost-per-run", type=float, help="per-episode dollar cap")
     b.add_argument("--max-time-per-run", type=float, help="per-episode time cap in seconds")
     b.add_argument("--out", help="output directory (default: runs/bench-<timestamp>)")
@@ -152,10 +168,11 @@ async def _games(args: argparse.Namespace) -> int:
 async def _play(args: argparse.Namespace) -> int:
     prices = load_prices(args.prices)
     provider = create_provider(args.model, base_url=args.base_url, temperature=args.temperature, max_tokens=args.max_tokens,
-                               reasoning=args.reasoning)
+                               reasoning=args.reasoning, cache=args.cache == "on")
     cfg = RunConfig(
         game=args.game, model=args.model, max_turns=args.max_turns, max_cost=args.max_cost, max_time=args.max_time,
-        history=args.history, notes=args.notes, temperature=args.temperature, max_tokens=args.max_tokens, reasoning=args.reasoning,
+        history=args.history, notes=args.notes, format=args.format, cache=args.cache == "on",
+        temperature=args.temperature, max_tokens=args.max_tokens, reasoning=args.reasoning,
         base_url=args.base_url, grue_url=args.grue_url, out_dir=Path(args.out), run_id=args.run_id,
         quiet=args.quiet, meta=dict(args.seed_meta), price=prices.get(args.model),
     )
@@ -171,14 +188,71 @@ async def _play(args: argparse.Namespace) -> int:
     return {"completed": 0, "interrupted": 130}.get(summary["status"], 1)
 
 
-async def _bench(args: argparse.Namespace) -> int:
-    prices = load_prices(args.prices)
-    if args.max_cost_per_run is not None and (bad := uncapped_models(args.models, prices)):
+def _require_enforceable_cap(max_cost: float | None, models: Sequence[str], prices: dict[str, tuple[float, float]]) -> None:
+    if max_cost is not None and (bad := uncapped_models(models, prices)):
         raise ConfigError(  # spending without an effective cap is the dangerous direction: refuse to start
             f"--max-cost-per-run cannot be enforced for {', '.join(bad)}: the provider reports no dollar cost "
             "and --prices has no entry for it. Add the model to a --prices file, or drop --max-cost-per-run."
         )
-    out = Path(args.out) if args.out else Path("runs") / f"bench-{datetime.now():%Y%m%d-%H%M%S}"
+
+
+def _shell_path(path: Path) -> str:
+    text = str(path)
+    return f'"{text}"' if " " in text else text
+
+
+def _finish_bench(out: Path, interrupted: bool) -> int:
+    """Write the reports over every run in *out* and print the leaderboard."""
+    agg = write_reports(out, load_runs(out))
+    print()
+    print(render_leaderboard(agg))
+    print(f"wrote {out / 'leaderboard.md'}, results.csv, summary.json")
+    if interrupted:
+        print(f"interrupted: finished episodes are saved. To continue, run:\n"
+              f"  brass-lantern bench --resume {_shell_path(out)}", file=sys.stderr)
+    return 130 if interrupted else 0
+
+
+async def _bench_resume(args: argparse.Namespace) -> int:
+    out = Path(args.resume)
+    data = read_bench_json(out)
+    cfg = config_from_bench_json(data, out)
+    overrides: dict[str, object] = {}
+    if args.runs is not None and args.runs < cfg.runs:
+        raise ConfigError(f"--runs {args.runs} is lower than the {cfg.runs} this bench was started with; "
+                          "resume can only keep or raise it.")
+    for name in ("runs", "concurrency", "max_cost_per_run", "max_time_per_run", "grue_url"):
+        value = getattr(args, name)
+        if value is not None and value != getattr(cfg, name):
+            overrides[name] = value
+            setattr(cfg, name, value)
+    if args.prices:
+        new_prices = load_prices(args.prices)
+        cfg.prices = {**cfg.prices, **new_prices}
+        overrides["prices"] = sorted(new_prices)
+    _require_enforceable_cap(cfg.max_cost_per_run, cfg.models, cfg.prices)
+
+    jobs, total = plan_resume(cfg, load_runs(out))
+    done = total - len(jobs)
+    print(f"Resuming {out}: {done} of {total} episodes already done, "
+          + (f"running {len(jobs)}." if jobs else "nothing to run."))
+    data.update(bench_fields(cfg))  # keeps keys this version does not know, and created_at
+    data.setdefault("resumes", []).append({"at": now_utc(), "done": done, "running": len(jobs), "overrides": overrides})
+    write_bench_json(out, data)
+
+    interrupted = False
+    if jobs:
+        async with GrueClient(cfg.grue_url) as grue:
+            _, interrupted = await run_bench(cfg, grue=grue, jobs=jobs)
+    return _finish_bench(out, interrupted)
+
+
+async def _bench(args: argparse.Namespace) -> int:
+    if args.resume:
+        return await _bench_resume(args)
+    prices = load_prices(args.prices)
+    _require_enforceable_cap(args.max_cost_per_run, args.models, prices)
+    out =Path(args.out) if args.out else Path("runs") / f"bench-{datetime.now():%Y%m%d-%H%M%S}"
     async with GrueClient(args.grue_url) as grue:
         games = args.games
         if games == ["all"]:
@@ -186,18 +260,15 @@ async def _bench(args: argparse.Namespace) -> int:
         cfg = BenchConfig(
             models=args.models, games=games, runs=args.runs, max_turns=args.max_turns, concurrency=args.concurrency,
             max_cost_per_run=args.max_cost_per_run, max_time_per_run=args.max_time_per_run, history=args.history,
-            notes=args.notes, temperature=args.temperature, max_tokens=args.max_tokens, base_url=args.base_url,
+            notes=args.notes, format=args.format, cache=args.cache == "on", temperature=args.temperature,
+            max_tokens=args.max_tokens, base_url=args.base_url,
             reasoning=args.reasoning, grue_url=args.grue_url, out_dir=out, prices=prices,
         )
         total = len(cfg.models) * len(cfg.games) * cfg.runs
         print(f"bench: {len(cfg.models)} models x {len(cfg.games)} games x {cfg.runs} runs = {total} episodes "
               f"(concurrency {cfg.concurrency}) -> {out}")
         _, interrupted = await run_bench(cfg, grue=grue)
-    agg = write_reports(out, load_runs(out))
-    print()
-    print(render_leaderboard(agg))
-    print(f"wrote {out / 'leaderboard.md'}, results.csv, summary.json")
-    return 130 if interrupted else 0
+    return _finish_bench(out, interrupted)
 
 
 def _report(args: argparse.Namespace) -> int:
@@ -211,10 +282,35 @@ def _report(args: argparse.Namespace) -> int:
     return 0
 
 
+# bench options that may still be given with --resume; everything else comes from DIR/bench.json
+RESUME_OVERRIDES = {"command", "resume", "runs", "concurrency", "max_cost_per_run", "max_time_per_run", "grue_url", "prices"}
+
+
+def _check_bench_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Cross-option rules argparse cannot express. Also fills in the fresh-bench defaults for --runs/--concurrency."""
+    if args.resume:
+        defaults = vars(parser.parse_args(["bench", "--resume", args.resume]))
+        clash = [k for k, v in vars(args).items() if k not in RESUME_OVERRIDES and v != defaults.get(k)]
+        if clash:
+            parser.error("--resume takes its settings from DIR/bench.json, so it cannot be combined with "
+                         + ", ".join("--" + k.replace("_", "-") for k in clash)
+                         + ". Only --runs, --concurrency, --max-cost-per-run, --max-time-per-run, --grue-url "
+                         "and --prices can be changed on resume.")
+        return
+    missing = [f"--{k}" for k in ("models", "games") if not getattr(args, k)]
+    if missing:
+        parser.error("the following arguments are required: " + ", ".join(missing) + " (or use --resume DIR)")
+    args.runs = 3 if args.runs is None else args.runs
+    args.concurrency = 4 if args.concurrency is None else args.concurrency
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     setup_stdio()
     load_dotenv(find_dotenv(usecwd=True))
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "bench":
+        _check_bench_args(parser, args)
     try:
         if args.command == "report":
             return _report(args)

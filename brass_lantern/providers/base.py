@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -20,6 +22,7 @@ class ProviderError(Exception):
     """
 
     partial: "Completion | None" = None
+    status: int | None = None  # HTTP status of a non-retryable failure, when there was one
 
 
 class ConfigError(Exception):
@@ -36,6 +39,12 @@ class Completion:
     cost_usd: float | None = None  # None = provider did not report a dollar cost
     latency_s: float = 0.0  # duration of the successful HTTP attempt
     finish_reason: str | None = None
+    # Prompt tokens served from / written to the provider's prompt cache. Both are already
+    # included in input_tokens (which is always the total prompt size).
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    # Native tool/function calls, provider-neutral: [{"name": str, "arguments": dict}], else None.
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 class Provider(ABC):
@@ -43,17 +52,27 @@ class Provider(ABC):
 
     ``messages`` are ``{"role": "user"|"assistant", "content": str}`` dicts,
     starting with a user message. Each provider maps them to its own wire format.
+
+    ``tools`` is an optional provider-neutral list like
+    ``[{"name": "act", "description": "...", "parameters": <JSON schema>}]``; providers that
+    support native tool calling force a call and return it in ``Completion.tool_calls``.
+    ``cache`` turns on provider-side prompt caching where the provider needs a request hint.
     """
 
     name = "provider"
 
-    def __init__(self, model: str, *, temperature: float | None = 0.7, max_tokens: int = 1024):
+    def __init__(
+        self, model: str, *, temperature: float | None = 0.7, max_tokens: int = 1024, cache: bool = True
+    ):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.cache = cache
 
     @abstractmethod
-    async def complete(self, system: str, messages: list[dict[str, str]]) -> Completion: ...
+    async def complete(
+        self, system: str, messages: list[dict[str, str]], tools: list[dict[str, Any]] | None = None
+    ) -> Completion: ...
 
     async def aclose(self) -> None:  # pragma: no cover - default is a no-op
         return None
@@ -86,11 +105,12 @@ class HTTPProvider(Provider):
         base_url: str,
         temperature: float | None = 0.7,
         max_tokens: int = 1024,
+        cache: bool = True,
         timeout: float = 120.0,
         transport: httpx.AsyncBaseTransport | None = None,
         sleep=asyncio.sleep,
     ):
-        super().__init__(model, temperature=temperature, max_tokens=max_tokens)
+        super().__init__(model, temperature=temperature, max_tokens=max_tokens, cache=cache)
         self.base_url = base_url.rstrip("/")
         self._http = httpx.AsyncClient(timeout=timeout, transport=transport)
         self._sleep = sleep
@@ -136,7 +156,9 @@ class HTTPProvider(Provider):
                     except ValueError:
                         retry_after = None
             if not retryable:
-                raise ProviderError(f"{self.name}: {problem}")
+                err = ProviderError(f"{self.name}: {problem}")
+                err.status = resp.status_code  # (connection errors are always retryable, so resp exists here)
+                raise err
             if attempt == self.max_retries:
                 raise ProviderError(f"{self.name}: {problem} (gave up after {attempt + 1} attempts)")
             delay = min(self.backoff_cap, self.backoff_base * 2**attempt)
@@ -155,3 +177,89 @@ def merge_consecutive(messages: list[dict[str, str]]) -> list[dict[str, str]]:
         else:
             merged.append(dict(m))
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Prompt-cache and tool-calling helpers shared by the providers
+# ---------------------------------------------------------------------------
+
+CACHE_CONTROL = {"type": "ephemeral"}
+
+
+def to_int(value: Any) -> int:
+    """A usage counter as an int; missing, null or junk values count as 0."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def with_cache_breakpoint(message: dict[str, Any]) -> dict[str, Any]:
+    """Copy of a chat message whose last content block carries ``cache_control``.
+
+    String content becomes a one-element block list; a block list is copied with the marker added
+    to its last block. The input message is left untouched.
+    """
+    content = message["content"]
+    if isinstance(content, str):
+        blocks: list[dict[str, Any]] = [{"type": "text", "text": content}]
+    else:
+        blocks = [dict(b) for b in content]
+    if blocks:
+        blocks[-1] = {**blocks[-1], "cache_control": dict(CACHE_CONTROL)}
+    return {**message, "content": blocks}
+
+
+_STRING_PAIR = re.compile(r'"([A-Za-z_][\w-]*)"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def parse_tool_arguments(raw: Any) -> dict[str, Any]:
+    """Tool-call arguments as a dict, whatever the model sent.
+
+    Accepts an already decoded dict or a JSON string. Broken JSON (truncated, trailing text, ...)
+    is salvaged by picking out its ``"key": "string"`` pairs; if nothing can be recovered the
+    result is ``{"_raw": <the original text>}`` so callers can see what arrived.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if raw is None or raw == "":
+        return {}
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            salvaged: dict[str, Any] = {}
+            for key, val in _STRING_PAIR.findall(raw):
+                try:
+                    salvaged[key] = json.loads(f'"{val}"')
+                except ValueError:
+                    salvaged[key] = val
+            return salvaged or {"_raw": raw}
+        return data if isinstance(data, dict) else {"_raw": raw}
+    return {"_raw": str(raw)}
+
+
+def tool_call(name: Any, arguments: Any) -> dict[str, Any]:
+    return {"name": str(name or ""), "arguments": parse_tool_arguments(arguments)}
+
+
+_TOOLS_UNSUPPORTED = re.compile(
+    r"no endpoints found that support tool|support(?:s|ed)? tool|tool use|tool[_ ]choice|tool calling|"
+    r"function[ _]call|tools? (?:is|are)? ?not supported",
+    re.IGNORECASE,
+)
+
+
+def explain_tool_error(provider: Provider, err: ProviderError) -> ProviderError:
+    """Turn "this model has no tool support" failures into a clear, non-retryable error.
+
+    OpenRouter answers 404 "No endpoints found that support tool use" for such models; other
+    servers use 400/422 wording. Anything else (timeouts, 5xx after retries) passes through.
+    """
+    msg = str(err)
+    if "gave up after" in msg or not _TOOLS_UNSUPPORTED.search(msg):
+        return err
+    return ProviderError(
+        f"{provider.name}: model {provider.model!r} does not support tool calling "
+        f"({msg[:200]}). Use --format text for this model."
+    )

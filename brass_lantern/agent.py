@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from brass_lantern.grue_client import Observation
 from brass_lantern.providers import Completion, Provider, ProviderError
@@ -11,8 +12,13 @@ from brass_lantern.providers import Completion, Provider, ProviderError
 MAX_COMMAND_CHARS = 120
 MAX_NOTES_CHARS = 1500
 MAX_REASONING_CHARS = 300  # reasoning kept in the compact assistant history
+# With caching on, the history window start moves in chunks of this many turns instead of one at a
+# time, so the message prefix stays byte-identical (and cacheable) for HISTORY_STEP turns at a stretch.
+HISTORY_STEP = 10
 
-SYSTEM_PROMPT = """\
+FORMATS = ("text", "tools")
+
+_PROMPT_BODY = """\
 You are playing a classic text adventure (interactive fiction) through a text parser. \
 Your goal is to score as many points as you can and, if possible, finish the game.
 
@@ -33,7 +39,10 @@ and take anything portable. Check your inventory now and then.
 - Keep a mental map: note exits you have not tried yet and where items and locked things are.
 - Points usually come from finding treasures, solving puzzles, and reaching new places. \
 If a command fails, do not repeat it; try something different. Be careful around dangers.
+"""
 
+# The answer-format section is the only part that differs between --format text and --format tools.
+_RESPONSE_FORMAT_TEXT = """
 RESPONSE FORMAT
 - You may write brief reasoning first (a few sentences at most).
 - Your reply MUST end with a final line of the form:
@@ -43,6 +52,17 @@ RESPONSE FORMAT
 - Exactly one command after the ">". Nothing after that line.\
 """
 
+_RESPONSE_FORMAT_TOOLS = """
+RESPONSE FORMAT
+- You may think briefly first (a few sentences at most).
+- Then call the `act` tool with exactly one game command, for example command: "open mailbox".
+- Always finish by calling the `act` tool. Do not write the command only as text, and never \
+write the game's replies or the next turn yourself: the game answers after you act.\
+"""
+
+SYSTEM_PROMPT = _PROMPT_BODY.rstrip("\n") + "\n" + _RESPONSE_FORMAT_TEXT
+SYSTEM_PROMPT_TOOLS = _PROMPT_BODY.rstrip("\n") + "\n" + _RESPONSE_FORMAT_TOOLS
+
 NOTES_ADDENDUM = """
 
 NOTES
@@ -51,6 +71,34 @@ To update it, include a line starting with NOTES: (it may continue over a few fo
 It REPLACES your previous notes, so rewrite everything worth keeping: map, items, puzzles, goals. \
 Keep it under about 1500 characters. Your current notes are shown to you every turn.
 - Put NOTES before the final "> COMMAND" line."""
+
+NOTES_ADDENDUM_TOOLS = """
+
+NOTES
+- You can only see the most recent turns of the game, so keep a short notes scratchpad. \
+To update it, pass the optional `notes` argument of the `act` tool. \
+It REPLACES your previous notes, so rewrite everything worth keeping: map, items, puzzles, goals. \
+Keep it under about 1500 characters. Your current notes are shown to you every turn."""
+
+ACT_TOOL_DESCRIPTION = (
+    "Send exactly one command to the game. Use a short parser command such as 'open mailbox', "
+    "'take lamp' or 'north' (or a single key when the game is waiting for a keypress)."
+)
+
+
+def act_tool(notes: bool = False) -> dict[str, Any]:
+    """The provider-neutral ``act`` tool: one required ``command``, plus an optional ``notes``."""
+    props: dict[str, Any] = {"command": {"type": "string", "description": "The single game command to send."}}
+    if notes:
+        props["notes"] = {
+            "type": "string",
+            "description": "Optional. Your updated notes; they REPLACE the previous notes (under ~1500 characters).",
+        }
+    return {
+        "name": "act",
+        "description": ACT_TOOL_DESCRIPTION,
+        "parameters": {"type": "object", "properties": props, "required": ["command"]},
+    }
 
 CHAR_WARNING = (
     "[The game is waiting for a SINGLE KEYPRESS, not a typed command. Reply with one key: a single "
@@ -73,12 +121,16 @@ _QUOTE_MAP = str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"})
 @dataclass
 class ParsedCommand:
     command: str
-    method: str  # "prompt" (> CMD) | "tag" (COMMAND: CMD) | "last_line" | "repair" | "empty"
+    # How the command was obtained. Text format: "prompt" (> CMD) | "tag" (COMMAND: CMD) | "last_line" |
+    # "repair" | "empty". Tools format: "tool" (native act call) | "repair" (act call after a repair
+    # request) | "marker" (no tool call, but an explicit > CMD / COMMAND: line in the text) | "last_line" |
+    # "empty".
+    method: str
 
     @property
     def ok(self) -> bool:
-        """False when the reply had no explicit command marker (a format failure)."""
-        return self.method in ("prompt", "tag")
+        """False when the reply did not give the command the requested way (a format failure)."""
+        return self.method in ("prompt", "tag", "tool")
 
 
 def _core(line: str) -> str:
@@ -215,6 +267,11 @@ REPAIR_PROMPT = (
     "want to send, on one line starting with \">\", for example:\n> north"
 )
 
+TOOL_REPAIR_PROMPT = (
+    "You did not call the act tool. Call the `act` tool now with the single game command you want to "
+    "send, for example command: \"north\"."
+)
+
 _SENTENCE = re.compile(r"[.!?]\s+\S|[.!?]$")
 
 
@@ -243,6 +300,9 @@ def _merge(a: Completion, b: Completion) -> Completion:
         cost_usd=cost,
         latency_s=a.latency_s + b.latency_s,
         finish_reason=b.finish_reason,
+        cache_read_tokens=a.cache_read_tokens + b.cache_read_tokens,
+        cache_write_tokens=a.cache_write_tokens + b.cache_write_tokens,
+        tool_calls=((a.tool_calls or []) + (b.tool_calls or [])) or None,
     )
 
 # ---------------------------------------------------------------------------
@@ -264,8 +324,28 @@ class _Turn:
     assistant: str
 
 
+def _act_call(completion: Completion) -> tuple[str, str | None] | None:
+    """(cleaned command, notes) from the first usable ``act`` tool call of a reply, else None."""
+    for call in completion.tool_calls or []:
+        args = call.get("arguments")
+        if call.get("name") != "act" or not isinstance(args, dict):
+            continue
+        raw = args.get("command")
+        command = clean_command(raw) if isinstance(raw, str) else ""
+        if not command:
+            continue
+        notes = args.get("notes")
+        return command, ((notes.strip()[:MAX_NOTES_CHARS] or None) if isinstance(notes, str) else None)
+    return None
+
+
 class Agent:
-    """Holds the rolling context for one episode and asks the model for each move."""
+    """Holds the rolling context for one episode and asks the model for each move.
+
+    ``format`` is how the model answers: "text" (a final ``> COMMAND`` line) or "tools" (a native
+    ``act`` tool call). ``cache`` makes the history window advance in steps of HISTORY_STEP turns so
+    provider prompt caches can hit; with it off the window slides one turn at a time, as it always did.
+    """
 
     def __init__(
         self,
@@ -274,13 +354,24 @@ class Agent:
         max_turns: int | None = None,
         history: int = 30,
         notes: bool = False,
+        format: str = "text",
+        cache: bool = True,
     ):
+        if format not in FORMATS:
+            raise ValueError(f"format must be one of {', '.join(FORMATS)}, not {format!r}")
         self.provider = provider
         self.max_turns = max_turns
         self.history = max(0, history)
         self.notes_enabled = notes
         self.notes = ""
-        self.system_prompt = SYSTEM_PROMPT + (NOTES_ADDENDUM if notes else "")
+        self.format = format
+        self.step = HISTORY_STEP if cache else 0  # 0 = slide one turn at a time
+        if format == "tools":
+            self.system_prompt = SYSTEM_PROMPT_TOOLS + (NOTES_ADDENDUM_TOOLS if notes else "")
+            self.tools: list[dict[str, Any]] | None = [act_tool(notes)]
+        else:
+            self.system_prompt = SYSTEM_PROMPT + (NOTES_ADDENDUM if notes else "")
+            self.tools = None
         self._turns: list[_Turn] = []
 
     # -- prompt construction ----------------------------------------------
@@ -302,20 +393,25 @@ class Agent:
 
     def build_messages(self, obs: Observation) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
-        for t in self._turns[-self.history :] if self.history else []:
+        for t in self._turns:  # act() keeps _turns trimmed to the window
             messages.append({"role": "user", "content": t.user})
             messages.append({"role": "assistant", "content": t.assistant})
         current = self.render_observation(obs)
         if self.notes_enabled:
-            current += "\n\n[Your notes]\n" + (self.notes or "(empty: write a NOTES: line to start keeping notes)")
+            hint = "pass notes to the act tool" if self.format == "tools" else "write a NOTES: line"
+            current += "\n\n[Your notes]\n" + (self.notes or f"(empty: {hint} to start keeping notes)")
         messages.append({"role": "user", "content": current})
         return messages
 
     # -- one move ---------------------------------------------------------
 
-    async def act(self, obs: Observation) -> Decision:
-        messages = self.build_messages(obs)
-        completion = await self.provider.complete(self.system_prompt, messages)
+    async def _ask(self, messages: list[dict[str, str]]) -> Completion:
+        if self.tools:  # only pass `tools` when used, so plain two-argument providers keep working
+            return await self.provider.complete(self.system_prompt, messages, tools=self.tools)
+        return await self.provider.complete(self.system_prompt, messages)
+
+    async def _act_text(self, messages: list[dict[str, str]]) -> tuple[Completion, ParsedCommand]:
+        completion = await self._ask(messages)
         parsed = parse_command(completion.text)
         if not parsed.ok and looks_like_prose(_raw_last_line(completion.text)):
             # The model forgot the "> COMMAND" line and its last line is prose. Ask once for
@@ -326,7 +422,7 @@ class Agent:
                 {"role": "user", "content": REPAIR_PROMPT},
             ]
             try:
-                fix = await self.provider.complete(self.system_prompt, repair_messages)
+                fix = await self._ask(repair_messages)
             except ProviderError as e:
                 e.partial = completion  # the first call was paid for; let the runner bill it
                 raise
@@ -334,16 +430,78 @@ class Agent:
             completion = _merge(completion, fix)
             if fixed.command and not looks_like_prose(fixed.command):
                 parsed = ParsedCommand(fixed.command, "repair")
+        return completion, parsed
+
+    async def _act_tools(self, messages: list[dict[str, str]]) -> tuple[Completion, ParsedCommand, str | None]:
+        """One move in tools format: the command comes from the model's ``act`` tool call.
+
+        No tool call: if the text still carries an explicit command line, use it (method "marker")
+        without spending a repair call; otherwise ask once for the tool call (method "repair").
+        Both count as format failures. Last resort is the last line of the text, then the default.
+        """
+        completion = await self._ask(messages)
+        call = _act_call(completion)
+        if call:
+            return completion, ParsedCommand(call[0], "tool"), call[1]
+        text_parse = parse_command(completion.text)
+        if text_parse.method in ("prompt", "tag") and text_parse.command:
+            return completion, ParsedCommand(text_parse.command, "marker"), None
+        repair_messages = messages + [
+            {"role": "assistant", "content": completion.text or "(no tool call)"},
+            {"role": "user", "content": TOOL_REPAIR_PROMPT},
+        ]
+        try:
+            fix = await self._ask(repair_messages)
+        except ProviderError as e:
+            e.partial = completion  # the first call was paid for; let the runner bill it
+            raise
+        merged = _merge(completion, fix)
+        call = _act_call(fix)
+        if call:
+            return merged, ParsedCommand(call[0], "repair"), call[1]
+        # Still no tool call: salvage whatever the text says (the repair reply first), else play the default.
+        texts = (fix.text, completion.text)
+        for text in texts:
+            p = parse_command(text)
+            if p.method in ("prompt", "tag") and p.command:
+                return merged, ParsedCommand(p.command, "marker"), None
+        for text in texts:
+            p = parse_command(text)
+            if p.method == "last_line" and p.command and not looks_like_prose(_raw_last_line(text)):
+                return merged, p, None
+        return merged, ParsedCommand("", "empty"), None
+
+    def _trim_history(self) -> None:
+        if not self.history:
+            self._turns = []
+        elif self.step:
+            # Stepped window: keep at least `history` turns and drop the oldest `step` in one go once
+            # there are history + step. Between drops the start of the window does not move, so the
+            # rendered prefix is byte-identical from one call to the next (what prompt caches need).
+            while len(self._turns) >= self.history + self.step:
+                del self._turns[: self.step]
+        else:
+            self._turns = self._turns[-self.history :]  # sliding window (--cache off)
+
+    async def act(self, obs: Observation) -> Decision:
+        messages = self.build_messages(obs)
+        new_notes: str | None = None
+        if self.format == "tools":
+            completion, parsed, new_notes = await self._act_tools(messages)
+        else:
+            completion, parsed = await self._act_text(messages)
+            if self.notes_enabled:
+                new_notes = extract_notes(completion.text)
         command = parsed.command or ("return" if obs.input_type == "char" else "look")
-        if self.notes_enabled:
-            new_notes = extract_notes(completion.text)
-            if new_notes:
-                self.notes = new_notes
+        if self.notes_enabled and new_notes:
+            self.notes = new_notes
+        # History stays provider-neutral plain text in both formats: the user turn is the rendered
+        # observation (no notes: those only ever appear in the current message, so a past message never
+        # changes) and the assistant turn is the trimmed reasoning plus a "> command" line. Native
+        # tool_use/tool_result structures are deliberately not replayed: that would tie the history to
+        # one provider's wire format, and tool_choice forces the next call to be an act call anyway.
         self._turns.append(
             _Turn(self.render_observation(obs), compact_reply(completion.text, command, parsed))
         )
-        if self.history:
-            self._turns = self._turns[-self.history :]
-        else:
-            self._turns = []
+        self._trim_history()
         return Decision(command=command, reply=completion.text, completion=completion, parsed=parsed)

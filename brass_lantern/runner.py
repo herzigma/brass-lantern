@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from brass_lantern import __version__
-from brass_lantern.agent import Agent
+from brass_lantern.agent import HISTORY_STEP, Agent
 from brass_lantern.console import Reporter
 from brass_lantern.grue_client import GrueClient, GrueError, Observation, Result
 from brass_lantern.providers import Completion, Provider, ProviderError
@@ -22,6 +22,12 @@ from brass_lantern.providers import Completion, Provider, ProviderError
 # Model calls per episode are capped at this multiple of max_turns, in case the server stops advancing turns.
 MAX_CALLS_FACTOR = 3
 DEFAULT_MAX_TURNS = 1000  # matches Grue's DEFAULT_MAX_TURNS, used if the server does not say
+
+# Price-table billing of cached prompt tokens, as multiples of the input price. These are Anthropic's
+# rates (cache reads 0.1x, 5-minute cache writes 1.25x); other providers differ, so for them the
+# estimate is approximate. Providers that report a dollar cost (OpenRouter) never use these.
+CACHE_READ_PRICE_FACTOR = 0.1
+CACHE_WRITE_PRICE_FACTOR = 1.25
 
 
 @dataclass
@@ -33,6 +39,8 @@ class RunConfig:
     max_time: float | None = None  # seconds
     history: int = 30
     notes: bool = False
+    format: str = "text"  # how the model answers: "text" (> COMMAND line) or "tools" (native act call)
+    cache: bool = True  # prompt caching: stepped history window + provider cache hints
     temperature: float | None = 0.7
     max_tokens: int = 1024
     reasoning: str | None = None
@@ -77,6 +85,8 @@ class _Totals:
         self.turns = 0
         self.input_tokens = 0
         self.output_tokens = 0
+        self.cache_read_tokens = 0
+        self.cache_write_tokens = 0
         self.cost = 0.0
         self.cost_known = False
         self.model_time = 0.0
@@ -141,6 +151,9 @@ async def play_episode(
                 "max_time": cfg.max_time,
                 "history": cfg.history,
                 "notes": cfg.notes,
+                "format": cfg.format,
+                "cache": cfg.cache,
+                "history_step": HISTORY_STEP if cfg.cache else 0,  # 0 = sliding window
                 "temperature": cfg.temperature,
                 "max_tokens": cfg.max_tokens,
                 "reasoning": cfg.reasoning,
@@ -155,6 +168,11 @@ async def play_episode(
                 "ending": (result.ending if result else None) or (obs.ending if obs else None),
                 "input_tokens": totals.input_tokens,
                 "output_tokens": totals.output_tokens,
+                "cache_read_tokens": totals.cache_read_tokens,
+                "cache_write_tokens": totals.cache_write_tokens,
+                "cache_hit_rate": (
+                    round(totals.cache_read_tokens / totals.input_tokens, 4) if totals.input_tokens else None
+                ),
                 "cost_usd": round(totals.cost, 6) if totals.cost_known else None,
                 "wall_time_s": round(time.monotonic() - t0, 2),
                 "model_time_s": round(totals.model_time, 2),
@@ -169,9 +187,18 @@ async def play_episode(
         """Add one model reply's tokens, time and cost (price table if the provider gave none)."""
         cost = comp.cost_usd
         if cost is None and cfg.price:
-            cost = (comp.input_tokens * cfg.price[0] + comp.output_tokens * cfg.price[1]) / 1e6
+            # input_tokens is the whole prompt, cached parts included: bill those at their own rates.
+            plain = max(0, comp.input_tokens - comp.cache_read_tokens - comp.cache_write_tokens)
+            weighted = (
+                plain
+                + comp.cache_read_tokens * CACHE_READ_PRICE_FACTOR
+                + comp.cache_write_tokens * CACHE_WRITE_PRICE_FACTOR
+            )
+            cost = (weighted * cfg.price[0] + comp.output_tokens * cfg.price[1]) / 1e6
         totals.input_tokens += comp.input_tokens
         totals.output_tokens += comp.output_tokens
+        totals.cache_read_tokens += comp.cache_read_tokens
+        totals.cache_write_tokens += comp.cache_write_tokens
         totals.model_time += comp.latency_s
         if cost is not None:
             totals.cost += cost
@@ -203,7 +230,10 @@ async def play_episode(
                 except GrueError:
                     pass
                 max_turns = max_turns or DEFAULT_MAX_TURNS
-            agent = Agent(provider, max_turns=max_turns, history=cfg.history, notes=cfg.notes)
+            agent = Agent(
+                provider, max_turns=max_turns, history=cfg.history, notes=cfg.notes,
+                format=cfg.format, cache=cfg.cache,
+            )
             reporter.observation(obs.text)
 
             while not obs.game_over:
@@ -248,6 +278,9 @@ async def play_episode(
                         "notes": agent.notes if cfg.notes else None,
                         "input_tokens": comp.input_tokens,
                         "output_tokens": comp.output_tokens,
+                        "cache_read_tokens": comp.cache_read_tokens,
+                        "cache_write_tokens": comp.cache_write_tokens,
+                        "tool_calls": comp.tool_calls,
                         "cost_usd": cost,
                         "latency_s": round(comp.latency_s, 3),
                         "finish_reason": comp.finish_reason,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 from brass_lantern.providers.base import Completion, ProviderError, Provider
 
@@ -29,7 +30,10 @@ class ScriptedProvider(Provider):
         commands = [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
         return cls(commands, model=path, **kwargs)
 
-    async def complete(self, system: str, messages: list[dict[str, str]]) -> Completion:
+    async def complete(
+        self, system: str, messages: list[dict[str, str]], tools: list[dict[str, Any]] | None = None
+    ) -> Completion:
+        # `tools` is accepted and ignored: the replies are plain text, parsed as usual.
         if self._i < len(self._commands):
             command = self._commands[self._i]
             self._i += 1
@@ -46,7 +50,10 @@ class HumanProvider(Provider):
     def __init__(self, model: str = "human", **kwargs):
         super().__init__(model or "human", **kwargs)
 
-    async def complete(self, system: str, messages: list[dict[str, str]]) -> Completion:
+    async def complete(
+        self, system: str, messages: list[dict[str, str]], tools: list[dict[str, Any]] | None = None
+    ) -> Completion:
+        # `tools` is accepted and ignored: the replies are plain text, parsed as usual.
         try:
             line = await asyncio.to_thread(input, "your command> ")
         except EOFError as e:

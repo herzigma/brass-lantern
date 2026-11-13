@@ -63,6 +63,9 @@ class Reporter:
             f"== {summary['status']} ({summary['stop_reason']}) | ending={t.get('ending')} | score {score_s} | "
             f"{t['turns']} turns | {fmt_cost(t.get('cost_usd'))} | {fmt_duration(t['wall_time_s'])}"
         )
+        cached = (t.get("cache_read_tokens") or 0) + (t.get("cache_write_tokens") or 0)
+        if cached and t.get("input_tokens"):  # only when the provider reported any cache activity
+            line += f" | cache hit {(t.get('cache_read_tokens') or 0) / t['input_tokens'] * 100:.0f}%"
         if summary.get("error"):
             line += f"\n== error: {summary['error']}"
         self._print(("" if self.quiet else "\n") + line)

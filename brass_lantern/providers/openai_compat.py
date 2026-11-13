@@ -8,7 +8,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from brass_lantern.providers.base import Completion, HTTPProvider, ProviderError
+from brass_lantern.providers.base import (
+    CACHE_CONTROL,
+    Completion,
+    HTTPProvider,
+    ProviderError,
+    explain_tool_error,
+    to_int,
+    tool_call,
+    with_cache_breakpoint,
+)
 
 OPENAI_URL = "https://api.openai.com/v1"
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
@@ -57,17 +66,53 @@ class OpenAICompatProvider(HTTPProvider):
             return f"{err.get('message', err)} (code {code})", retryable
         return str(err), False
 
-    async def complete(self, system: str, messages: list[dict[str, str]]) -> Completion:
+    def _uses_cache_control(self) -> bool:
+        """OpenRouter forwards content-part ``cache_control`` to Anthropic models only.
+
+        Every other model family caches repeated prefixes by itself, so nothing is sent for them.
+        (Gemini Flash Lite's implicit cache hit 1 of 44 turns via OpenRouter on ~1-4k-token prompts;
+        explicit breakpoints made no difference at that size, so none are sent.)
+        """
+        return self.cache and self.name == "openrouter" and self.model.lower().startswith("anthropic/")
+
+    async def complete(
+        self, system: str, messages: list[dict[str, str]], tools: list[dict[str, Any]] | None = None
+    ) -> Completion:
+        chat: list[dict[str, Any]] = [{"role": "system", "content": system}, *messages]
+        if self._uses_cache_control():
+            chat[0] = {
+                "role": "system",
+                "content": [{"type": "text", "text": system, "cache_control": dict(CACHE_CONTROL)}],
+            }
+            last_user = max((i for i, m in enumerate(chat) if m["role"] == "user"), default=None)
+            if last_user is not None:
+                chat[last_user] = with_cache_breakpoint(chat[last_user])
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [{"role": "system", "content": system}, *messages],
+            "messages": chat,
             self._token_param: self.max_tokens,
             **self._extra_body,
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
+        if tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t["parameters"]},
+                }
+                for t in tools
+            ]
+            # Anthropic models reject a forced tool choice while reasoning is on (OpenRouter passes it through).
+            reasoning_on = "reasoning" in payload and self.model.lower().startswith("anthropic/")
+            payload["tool_choice"] = "auto" if reasoning_on else "required"
 
-        data, latency = await self._post_json(f"{self.base_url}/chat/completions", self._headers, payload)
+        try:
+            data, latency = await self._post_json(f"{self.base_url}/chat/completions", self._headers, payload)
+        except ProviderError as e:
+            if tools:
+                raise explain_tool_error(self, e) from e
+            raise
 
         choice = data["choices"][0]
         msg = choice.get("message") or {}
@@ -75,15 +120,30 @@ class OpenAICompatProvider(HTTPProvider):
         if not text.strip():
             # Reasoning models can spend the whole budget thinking and leave content empty.
             text = _content_text(msg.get("reasoning") or msg.get("reasoning_content"))
+        calls = [
+            tool_call(fn.get("name"), fn.get("arguments"))
+            for tc in msg.get("tool_calls") or []
+            if isinstance(tc, dict) and isinstance(fn := tc.get("function"), dict)
+        ]
         usage = data.get("usage") or {}
         cost = usage.get("cost")
         if cost is not None and not isinstance(cost, (int, float)):
             raise ProviderError(f"{self.name}: unexpected usage.cost value {cost!r}")
+        # OpenAI-style cache accounting: prompt_tokens already includes the cached part. OpenRouter
+        # adds a cache-write counter (its exact name is parsed defensively).
+        details = usage.get("prompt_tokens_details") or {}
         return Completion(
             text=text.strip(),
-            input_tokens=int(usage.get("prompt_tokens") or 0),
-            output_tokens=int(usage.get("completion_tokens") or 0),
+            input_tokens=to_int(usage.get("prompt_tokens")),
+            output_tokens=to_int(usage.get("completion_tokens")),
             cost_usd=float(cost) if cost is not None else None,
             latency_s=latency,
             finish_reason=choice.get("finish_reason"),
+            cache_read_tokens=to_int(details.get("cached_tokens")),
+            cache_write_tokens=to_int(
+                details.get("cache_write_tokens")
+                or details.get("cache_creation_input_tokens")
+                or usage.get("cache_creation_input_tokens")
+            ),
+            tool_calls=calls or None,
         )

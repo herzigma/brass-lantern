@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import dataclasses
 import json
+import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -12,9 +14,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from brass_lantern import __version__
 from brass_lantern.console import Reporter, fmt_cost, fmt_duration
 from brass_lantern.grue_client import GrueClient
-from brass_lantern.providers import Provider, create_provider
+from brass_lantern.providers import ConfigError, Provider, create_provider
 from brass_lantern.runner import RunConfig, make_run_id, play_episode
 
 # Runs that did not finish for infrastructure reasons say nothing about the model
@@ -33,6 +36,8 @@ class BenchConfig:
     max_time_per_run: float | None = None
     history: int = 30
     notes: bool = False
+    format: str = "text"  # "text" (> COMMAND line) or "tools" (native act tool call)
+    cache: bool = True  # prompt caching: stepped history window + provider cache hints
     temperature: float | None = 0.7
     max_tokens: int = 1024
     reasoning: str | None = None
@@ -43,6 +48,7 @@ class BenchConfig:
 
 
 ProviderFactory = Callable[..., Provider]
+Job = tuple[int, str, str]  # (repeat index from 0, game, model spec)
 
 
 async def run_bench(
@@ -51,23 +57,34 @@ async def run_bench(
     grue: GrueClient,
     provider_factory: ProviderFactory = create_provider,
     log: Callable[[str], None] = print,
+    jobs: list[Job] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Run the whole matrix. Returns (run summaries, interrupted)."""
+    """Run the whole matrix. Returns (run summaries, interrupted).
+
+    ``jobs`` is for resuming: run just these (repeat, game, model) jobs and leave bench.json to the
+    caller. Without it, run every job and write bench.json at the start.
+    """
     out = Path(cfg.out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     def make_provider(spec: str) -> Provider:
         return provider_factory(
             spec, base_url=cfg.base_url, temperature=cfg.temperature, max_tokens=cfg.max_tokens,
-            reasoning=cfg.reasoning,
+            reasoning=cfg.reasoning, cache=cfg.cache,
         )
 
-    for spec in cfg.models:  # fail fast on bad specs / missing keys, before spending anything
-        probe = make_provider(spec)
+    fresh = jobs is None
+    if jobs is None:
+        # Interleave repeats so a partial bench still covers every cell evenly.
+        jobs = [(i, game, spec) for i in range(cfg.runs) for game in cfg.games for spec in cfg.models]
+
+    for spec in (cfg.models if fresh else dict.fromkeys(s for _, _, s in jobs)):
+        probe = make_provider(spec)  # fail fast on bad specs / missing keys, before spending anything
         await probe.aclose()
 
-    # Interleave repeats so a partial bench still covers every cell evenly.
-    jobs = [(i, game, spec) for i in range(cfg.runs) for game in cfg.games for spec in cfg.models]
+    if fresh:
+        write_bench_json(out, new_bench_json(cfg))
+
     sem = asyncio.Semaphore(max(1, cfg.concurrency))
     summaries: list[dict[str, Any]] = []
     started = time.monotonic()
@@ -82,6 +99,8 @@ async def run_bench(
                 max_time=cfg.max_time_per_run,
                 history=cfg.history,
                 notes=cfg.notes,
+                format=cfg.format,
+                cache=cfg.cache,
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
                 reasoning=cfg.reasoning,
@@ -117,6 +136,104 @@ async def run_bench(
 
 
 # ---------------------------------------------------------------------------
+# bench.json and resume
+# ---------------------------------------------------------------------------
+
+BENCH_JSON = "bench.json"
+BENCH_JSON_VERSION = 1  # bump if the format changes incompatibly
+
+
+def now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def bench_fields(cfg: BenchConfig) -> dict[str, Any]:
+    """Every BenchConfig field as plain JSON, except out_dir (a bench lives wherever bench.json is)."""
+    data = dataclasses.asdict(cfg)
+    data.pop("out_dir", None)
+    return json.loads(json.dumps(data, default=str))  # tuples become lists, Paths become strings
+
+
+def new_bench_json(cfg: BenchConfig) -> dict[str, Any]:
+    return {"version": BENCH_JSON_VERSION, "created_at": now_utc(), "brass_lantern_version": __version__,
+            **bench_fields(cfg)}
+
+
+def write_bench_json(directory: str | Path, data: dict[str, Any]) -> None:
+    d = Path(directory)
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / (BENCH_JSON + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, d / BENCH_JSON)  # a crash mid-write never leaves a half-written bench.json
+
+
+def read_bench_json(directory: str | Path) -> dict[str, Any]:
+    d = Path(directory)
+    if not d.is_dir():
+        raise ConfigError(f"Cannot resume: {d} is not a directory.")
+    path = d / BENCH_JSON
+    if not path.is_file():
+        raise ConfigError(
+            f"Cannot resume {d}: it has no {BENCH_JSON} (benches started before resume support do not). "
+            "Start a new bench with --models and --games instead."
+        )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise ConfigError(f"Cannot read {path}: {e}") from e
+    if not isinstance(data, dict):
+        raise ConfigError(f"Cannot read {path}: expected a JSON object.")
+    version = data.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version > BENCH_JSON_VERSION:
+        raise ConfigError(f"{path} has format version {version!r}; this brass-lantern reads version {BENCH_JSON_VERSION}.")
+    return data
+
+
+def config_from_bench_json(data: dict[str, Any], directory: str | Path) -> BenchConfig:
+    """Rebuild a BenchConfig: unknown keys are ignored, missing ones take the dataclass defaults."""
+    known = {f.name for f in dataclasses.fields(BenchConfig)} - {"out_dir"}
+    kwargs = {k: v for k, v in data.items() if k in known}
+    absent = [k for k in ("models", "games") if not kwargs.get(k)]
+    if absent:
+        raise ConfigError(f"{Path(directory) / BENCH_JSON} has no {' or '.join(absent)}; cannot resume.")
+    try:
+        kwargs["prices"] = {m: (float(p[0]), float(p[1])) for m, p in (kwargs.get("prices") or {}).items()}
+    except (TypeError, ValueError, IndexError, AttributeError) as e:
+        raise ConfigError(f"{Path(directory) / BENCH_JSON} has bad prices: {e}") from e
+    return BenchConfig(out_dir=Path(directory), **kwargs)
+
+
+def plan_resume(cfg: BenchConfig, runs: list[dict[str, Any]]) -> tuple[list[Job], int]:
+    """Work out what a resumed bench still has to run. Returns (jobs left, total jobs in the matrix).
+
+    A run fills a (game, model) slot if it counts towards scores (see _counted): completed runs, and
+    provider_error runs that played a turn. Error, interrupted and still-running runs are left for a
+    rerun. A run goes in the slot named by its meta.repeat; runs without one (not written by run_bench)
+    fill the lowest free slots of their cell. Excluded run dirs stay on disk; aggregation ignores them.
+    """
+    cells = {(g, m) for g in cfg.games for m in cfg.models}
+    taken: dict[tuple[str, str], set[int]] = defaultdict(set)
+    unlabelled: dict[tuple[str, str], int] = defaultdict(int)
+    for run in runs:
+        cell = (run.get("game"), run.get("model"))
+        if cell not in cells or not _counted(run, run["totals"].get("turns") or 0)[0]:
+            continue
+        meta = (run.get("config") or {}).get("meta")
+        repeat = meta.get("repeat") if isinstance(meta, dict) else None
+        if isinstance(repeat, int) and not isinstance(repeat, bool) and repeat >= 1:
+            taken[cell].add(repeat - 1)
+        else:
+            unlabelled[cell] += 1
+    missing: set[Job] = set()
+    for (game, spec) in cells:
+        free = [i for i in range(cfg.runs) if i not in taken[(game, spec)]]
+        missing.update((i, game, spec) for i in free[unlabelled[(game, spec)]:])
+    # Same order as a fresh bench: repeats interleaved so a partial bench still covers every cell.
+    jobs = [(i, g, m) for i in range(cfg.runs) for g in cfg.games for m in cfg.models if (i, g, m) in missing]
+    return jobs, len(cells) * cfg.runs
+
+
+# ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
 
@@ -134,7 +251,7 @@ def load_runs(directory: str | Path) -> list[dict[str, Any]]:
 
 
 # Settings that change how a model plays; runs of one spec with different values are separate rows.
-CONFIG_KNOBS = ("notes", "temperature", "history", "reasoning", "max_tokens", "max_turns")
+CONFIG_KNOBS = ("notes", "temperature", "history", "reasoning", "max_tokens", "max_turns", "cache", "format")
 
 
 def _counted(run: dict[str, Any], turns: int) -> tuple[bool, str | None]:
@@ -182,12 +299,20 @@ def _flat(run: dict[str, Any]) -> dict[str, Any]:
         "reasoning": cfg.get("reasoning"),
         "max_tokens": cfg.get("max_tokens"),
         "max_turns": cfg.get("max_turns"),
+        # Runs from before these options existed used a sliding window and the text format.
+        "cache": bool(cfg.get("cache")),
+        "history_step": cfg.get("history_step") or 0,
+        "format": cfg.get("format") or "text",
+        "cache_read_tokens": t.get("cache_read_tokens") or 0,
+        "cache_write_tokens": t.get("cache_write_tokens") or 0,
     }
 
 
 def _knob_text(name: str, value: Any) -> str:
     if name == "notes":
         return "notes" if value else "no notes"
+    if name == "cache":
+        return "cache" if value else "no cache"
     short = {"temperature": "t", "history": "h", "max_turns": "turns"}.get(name, name)
     if value is None:
         value = {"temperature": "none", "reasoning": "default"}.get(name, "?")
@@ -319,7 +444,7 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
         "ended in a `provider_error` after at least one turn (scored as reached and counted in Errors). Runs "
         "that hit a harness problem (`grue_error`, `interrupted`, `error`) are excluded and listed at the end; "
         "their cost still counts. Rows with the same model spec but different settings (temperature, history, "
-        "notes, reasoning, max tokens, max turns) are separate rows, labelled with the differing settings.",
+        "notes, reasoning, max tokens, max turns, cache, format) are separate rows, labelled with the differing settings.",
         "",
         "Win = game ended `won`. Invalid % = parser rejections per command (server-reported). Format fail % = "
         "replies without a `> COMMAND` line. Errors = valid runs that ended in a provider error.",
@@ -387,7 +512,7 @@ CSV_FIELDS = [
     "run_id", "model", "variant", "game", "status", "stop_reason", "counted", "excluded_reason", "ending",
     "score", "max_score", "max_score_reached", "norm", "turns", "invalid_commands", "parse_failures",
     "input_tokens", "output_tokens", "cost_usd", "wall_time_s", "temperature", "history", "notes", "reasoning",
-    "max_tokens", "max_turns",
+    "max_tokens", "max_turns", "cache", "history_step", "format", "cache_read_tokens", "cache_write_tokens",
 ]
 
 
