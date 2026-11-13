@@ -35,6 +35,11 @@ brass-lantern play --game zork1 --model openrouter:anthropic/claude-haiku-4.5 --
 You will see the game text, then `🤖 [n] command` with the running score, spend and latency.
 Use `--quiet` to print only the final summary line. Ctrl-C ends the session cleanly and still writes the run files.
 
+### Against the hosted server
+
+A public Grue runs at **https://grue.party**. Set `GRUE_URL=https://grue.party` and `GRUE_API_KEY=<your key>`
+in `.env`. Keys are issued by the server's operator.
+
 ## Model specs
 
 A model is `provider:model` (split on the first colon, so `ollama:llama3.1:8b` works).
