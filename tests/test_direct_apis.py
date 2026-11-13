@@ -98,6 +98,8 @@ def test_the_provider_records_the_effective_settings():
     assert (p.effort, p.temperature, p.max_tokens) == ("high", None, 16000)
     assert p.describe()["effort"] == "high" and p.describe()["temperature"] is None
     p = create_provider("openai:gpt-6.1-sol", env=O_ENV)
+    assert (p.effort, p.temperature, p.max_tokens) == (None, None, 1024)  # reasoning model: no temperature
+    p = create_provider("openai:gpt-4.1", env=O_ENV)
     assert (p.effort, p.temperature, p.max_tokens) == (None, 0.7, 1024)
     assert create_provider("anthropic:claude-sonnet-5-5", env=A_ENV, effort="max").effort == "max"
     # the old name still works
@@ -214,7 +216,7 @@ def test_openai_gpt_6_1_sol_medium_payload():
     assert body["model"] == "gpt-6.1-sol"
     assert body["reasoning_effort"] == "medium"
     assert body["max_completion_tokens"] == 16000 and "max_tokens" not in body
-    assert body["temperature"] == 0.7  # sent first; the 400 safety net removes it if the model rejects it
+    assert "temperature" not in body  # GPT-5/6 and o-series reject it, so it is never sent
     assert seen[0].headers["authorization"] == "Bearer k"
 
 
@@ -248,14 +250,14 @@ TEMP_400 = httpx.Response(
 
 
 def test_a_400_about_temperature_drops_it_warns_once_and_retries_once(capsys):
-    p, seen, delays = make("openai:gpt-6.1-sol", [TEMP_400, OPENAI_OK, OPENAI_OK], env=O_ENV)
+    p, seen, delays = make("openai:gpt-4.1", [TEMP_400, OPENAI_OK, OPENAI_OK], env=O_ENV)
     c = run(p.complete(SYSTEM, MSGS))
     assert c.text == "> look" and len(seen) == 2 and delays == []
     assert sent(seen, 0)["temperature"] == 0.7 and "temperature" not in sent(seen, 1)
     assert sent(seen, 1)["messages"] == sent(seen, 0)["messages"]
     assert p.temperature is None and p.temperature_dropped and p.describe()["temperature"] is None
     err = capsys.readouterr().err
-    assert err.count("warning:") == 1 and "temperature" in err and "gpt-6.1-sol" in err
+    assert err.count("warning:") == 1 and "temperature" in err and "gpt-4.1" in err
     # later calls never send it, and never warn again
     run(p.complete(SYSTEM, MSGS))
     assert len(seen) == 3 and "temperature" not in sent(seen, 2) and capsys.readouterr().err == ""
@@ -276,17 +278,17 @@ def test_the_temperature_retry_also_covers_anthropic_and_gemini_payloads(capsys)
 
 
 def test_other_400s_are_not_retried_and_a_second_failure_is_raised(capsys):
-    p, seen, _ = make("openai:gpt-6.1-sol", [httpx.Response(400, json={"error": {"message": "bad model"}})], env=O_ENV)
+    p, seen, _ = make("openai:gpt-4.1", [httpx.Response(400, json={"error": {"message": "bad model"}})], env=O_ENV)
     with pytest.raises(ProviderError, match="bad model"):
         run(p.complete(SYSTEM, MSGS))
     assert len(seen) == 1 and p.temperature == 0.7 and not p.temperature_dropped
     # no temperature in the request: a 400 that mentions it is not ours to fix
-    p, seen, _ = make("openai:gpt-6.1-sol", [TEMP_400], env=O_ENV, temperature=None)
+    p, seen, _ = make("openai:gpt-4.1", [TEMP_400], env=O_ENV, temperature=None)
     with pytest.raises(ProviderError, match="temperature"):
         run(p.complete(SYSTEM, MSGS))
     assert len(seen) == 1
     # the retry happens once: a second 400 is raised, even one that mentions temperature again
-    p, seen, _ = make("openai:gpt-6.1-sol", [TEMP_400], env=O_ENV)
+    p, seen, _ = make("openai:gpt-4.1", [TEMP_400], env=O_ENV)
     with pytest.raises(ProviderError, match="temperature") as ei:
         run(p.complete(SYSTEM, MSGS))
     assert len(seen) == 2 and ei.value.status == 400
@@ -294,7 +296,29 @@ def test_other_400s_are_not_retried_and_a_second_failure_is_raised(capsys):
 
 
 def test_the_temperature_retry_keeps_tools_in_the_payload():
-    p, seen, _ = make("openai:gpt-6.1-sol", [TEMP_400, OPENAI_TOOL_OK], env=O_ENV)
+    p, seen, _ = make("openai:gpt-4.1", [TEMP_400, OPENAI_TOOL_OK], env=O_ENV)
     c = run(p.complete(SYSTEM, MSGS, tools=TOOLS))
     assert sent(seen, 1)["tool_choice"] == "required" and "temperature" not in sent(seen, 1)
     assert c.tool_calls == [{"name": "act", "arguments": {"command": "look"}}]
+
+
+def test_openai_reasoning_models_get_no_temperature():
+    from brass_lantern.providers.models import resolve_settings
+
+    assert resolve_settings("openai:gpt-6-luna@low", temperature=0.7).temperature is None
+    assert resolve_settings("openai:gpt-6.1-sol", temperature=0.7).temperature is None
+    assert resolve_settings("openai:o3", temperature=0.7).temperature is None
+    assert resolve_settings("openai:gpt-4o-mini", temperature=0.7).temperature == 0.7
+    assert resolve_settings("openrouter:openai/gpt-6-luna", temperature=0.7).temperature == 0.7
+
+
+def test_tools_with_reasoning_effort_error_is_explained():
+    from brass_lantern.providers.base import ProviderError, explain_tool_error
+
+    class P:
+        name, model = "openai", "gpt-6-luna"
+
+    raw = ProviderError('openai: HTTP 400: {"error": {"message": "Function tools with reasoning_effort are '
+                        'not supported for gpt-6-luna in /v1/chat/completions."}}')
+    out = explain_tool_error(P(), raw)
+    assert "--format text" in str(out) and "effort" in str(out)

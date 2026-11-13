@@ -95,14 +95,16 @@ OpenRouter drops settings a model does not support; the direct APIs answer HTTP 
 what each model accepts:
 
 - **Temperature.** Not sent to Anthropic models that reject it: every `claude-opus|sonnet|haiku|fable|mythos-5...`
-  model, plus `claude-opus-4-7` and `claude-opus-4-8`. For anything else, including `openai:` models, it is sent as
-  asked (default 0.7), and if the API answers a non-retryable 400 that mentions `temperature`, the provider drops it,
+  model, plus `claude-opus-4-7` and `claude-opus-4-8`, nor to OpenAI reasoning models (`openai:gpt-5...`, `gpt-6...`,
+  `o1`/`o3`/...). For anything else it is sent as asked (default 0.7), and if the API answers a non-retryable 400 that mentions `temperature`, the provider drops it,
   prints one warning on stderr and repeats the call once without it (and omits it from then on). The temperature
   actually sent is recorded (`null` if none), so old 0.7 runs and new no-temperature runs are separate leaderboard rows.
   Pass `--temperature none` to send none anywhere. Via OpenRouter the temperature is still sent as before.
 - **Tool choice (`--format tools`).** Forced tool choice (`{"type": "any"}`) is a 400 on Opus 5.5, Sonnet 5.5, Fable 5.1 and
   5.2 and Mythos, so those get `{"type": "auto"}`, both direct and as `openrouter:anthropic/...` (which sends `"auto"`).
   Other models keep the forced choice. A model that then answers in text goes through the usual repair path.
+  OpenAI's chat-completions API refuses tools combined with `reasoning_effort` on GPT-6 models (it wants the Responses
+  API), so for `openai:gpt-6...@effort` use `--format text`, drop the effort, or go through `openrouter:openai/...`.
 - **Thinking.** Not configured: the 5.x models think adaptively by default (`budget_tokens` and `{"type": "disabled"}` are
   400s on them). Thinking blocks are ignored and history is plain text, as always. Thinking tokens are billed as output.
 - **max_tokens.** Thinking tokens count against it. `--max-tokens` defaults to 16000 for `anthropic:` specs and whenever an

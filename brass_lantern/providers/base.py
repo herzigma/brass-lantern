@@ -304,6 +304,13 @@ def explain_tool_error(provider: Provider, err: ProviderError) -> ProviderError:
     servers use 400/422 wording. Anything else (timeouts, 5xx after retries) passes through.
     """
     msg = str(err)
+    if "reasoning_effort" in msg and "tools" in msg.lower():
+        # OpenAI's chat-completions API refuses function tools combined with reasoning_effort on
+        # GPT-6 models (it wants the Responses API for that).
+        return ProviderError(
+            f"{provider.name}: model {provider.model!r} cannot use tools together with a reasoning effort "
+            f"on this API ({msg[:200]}). Use --format text, or drop the effort setting."
+        )
     if "gave up after" in msg or not _TOOLS_UNSUPPORTED.search(msg):
         return err
     return ProviderError(

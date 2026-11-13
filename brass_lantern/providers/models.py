@@ -87,6 +87,15 @@ _NO_TEMPERATURE = re.compile(r"^claude-(?:(?:opus|sonnet|haiku|fable|mythos)-5|o
 _NO_FORCED_TOOL_CHOICE = re.compile(r"^claude-(?:opus-5-5|sonnet-5-5|fable-5-[12]|mythos)(?:-|$)")
 
 
+# OpenAI reasoning models (GPT-5/6 families and o-series) answer 400 to a non-default temperature
+# (seen live on gpt-6-luna, 2026-11-13); omit it up front so run.json and the Grue meta say what was sent.
+_OPENAI_NO_TEMPERATURE = re.compile(r"^(?:gpt-[56]|o\d)", re.IGNORECASE)
+
+
+def openai_rejects_temperature(model: str) -> bool:
+    return bool(_OPENAI_NO_TEMPERATURE.match(model))
+
+
 def anthropic_rejects_temperature(model: str) -> bool:
     return bool(_NO_TEMPERATURE.match(anthropic_model_id(model)))
 
@@ -143,6 +152,8 @@ def resolve_settings(
     elif chosen and ms.provider == "ollama":
         raise ConfigError(f"{ms.base}: --effort / @effort is not supported for ollama models.")
     if temperature is not None and ms.provider == "anthropic" and anthropic_rejects_temperature(ms.model):
+        temperature = None
+    if temperature is not None and ms.provider == "openai" and openai_rejects_temperature(ms.model):
         temperature = None
     if max_tokens is None:
         max_tokens = THINKING_MAX_TOKENS if (ms.provider == "anthropic" or chosen) else DEFAULT_MAX_TOKENS
