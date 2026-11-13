@@ -42,15 +42,16 @@ in `.env`. Keys are issued by the server's operator.
 
 ## Model specs
 
-A model is `provider:model` (split on the first colon, so `ollama:llama3.1:8b` works).
+A model is `provider:model` (split on the first colon, so `ollama:llama3.1:8b` works), optionally followed by
+`@effort` (see [Reasoning effort](#reasoning-effort)): `anthropic:claude-sonnet-5-5@high`.
 
 | Spec | Key / endpoint | Notes |
 |---|---|---|
-| `openrouter:<vendor/model>` | `OPENROUTER_API_KEY`, https://openrouter.ai/api/v1 | Requests `usage.include` and records the real dollar `usage.cost`. Sends `HTTP-Referer` (override with `OPENROUTER_REFERER`) and `X-Title: Brass Lantern`. |
-| `openai:<model>` | `OPENAI_API_KEY`, https://api.openai.com/v1 | Uses `max_completion_tokens`. |
+| `openrouter:<vendor/model>` | `OPENROUTER_API_KEY`, https://openrouter.ai/api/v1 | Requests `usage.include` and records the real dollar `usage.cost`. Sends `HTTP-Referer` (override with `OPENROUTER_REFERER`) and `X-Title: Brass Lantern`. OpenRouter silently drops settings a model does not support. |
+| `openai:<model>` | `OPENAI_API_KEY`, https://api.openai.com/v1 | Uses `max_completion_tokens`. Direct API: see [Direct Anthropic and OpenAI runs](#direct-anthropic-and-openai-runs). |
 | `openai:<model>` + `--base-url URL` | `OPENAI_API_KEY` optional | Any OpenAI-compatible server (vLLM, LM Studio, Together, ...). Uses `max_tokens`. |
 | `ollama:<model>` | none, http://localhost:11434/v1 | Local models. |
-| `anthropic:<model>` | `ANTHROPIC_API_KEY`, https://api.anthropic.com | `ANTHROPIC_BASE_URL` is deliberately **not** read; use `--base-url` to override. |
+| `anthropic:<model>` | `ANTHROPIC_API_KEY`, https://api.anthropic.com | `ANTHROPIC_BASE_URL` is deliberately **not** read; use `--base-url` to override. Direct API: see [Direct Anthropic and OpenAI runs](#direct-anthropic-and-openai-runs). |
 | `gemini:<model>` | `GEMINI_API_KEY` | Key goes in the `x-goog-api-key` header, never the URL. |
 | `mock:<script.txt>` | none | Replays one command per line (`#` comments allowed), then `look`. For tests and dry runs. |
 | `human:` | none | You type the commands. Handy for debugging the harness. |
@@ -59,7 +60,55 @@ Every call returns a `Completion` (text, input/output tokens, cache read/write t
 or `None`, latency). 429, 5xx and timeouts
 are retried with exponential backoff (1s, 2s, 4s, ... capped at 30s, `Retry-After` honoured, up to 5 retries) before a
 clear error is raised. If a reasoning model returns empty `content`, its reasoning text is used instead; if that is
-empty too, the harness plays `look` and records a parse failure (raise `--max-tokens` for reasoning models, e.g. 4096+).
+empty too, the harness plays `look` and records a parse failure (reasoning models need room to think: see `--max-tokens`).
+
+## Reasoning effort
+
+`--effort minimal|low|medium|high|xhigh|max` sets how hard a model thinks (`--reasoning` still works as a deprecated alias).
+Without it, nothing is sent and the provider's default applies. A suffix on the spec overrides the flag for that
+spec, so one bench can compare efforts:
+
+```bash
+brass-lantern bench --models anthropic:claude-sonnet-5-5@low,anthropic:claude-sonnet-5-5@high --games skerrin-light
+brass-lantern bench --effort medium --models openai:gpt-6.1-sol,anthropic:claude-opus-5-5@high --games zork1
+```
+
+`@low` and `@high` are two different models everywhere: run ids (`...-anthropic-claude-sonnet-5-5-low-xxxx`),
+leaderboard rows, `results.csv`, `bench.json` and `--resume` matching. They share the base model's price. Grue gets
+the model without the suffix and the effort in a separate field.
+
+| Provider | What is sent |
+|---|---|
+| `anthropic:` | `output_config: {"effort": ...}`. `minimal` is an error (the API has none). No `thinking` field is sent: thinking is adaptive on the 5.x models. |
+| `openai:` | `reasoning_effort`. Not sent to an `openai:` spec with `--base-url` (a generic server). |
+| `openrouter:` | `reasoning: {"effort": ...}`. |
+| `gemini:` | Not supported: an error that suggests `openrouter:google/...`. |
+| `ollama:` | Not supported: an error. |
+| `mock:`, `human:` | Ignored. |
+
+The effort actually sent (`null` if none) is recorded in `run.json` (`config.effort`), in the session meta and in
+`results.csv`.
+
+## Direct Anthropic and OpenAI runs
+
+OpenRouter drops settings a model does not support; the direct APIs answer HTTP 400 instead. Brass Lantern sends only
+what each model accepts:
+
+- **Temperature.** Not sent to Anthropic models that reject it: every `claude-opus|sonnet|haiku|fable|mythos-5...`
+  model, plus `claude-opus-4-7` and `claude-opus-4-8`. For anything else, including `openai:` models, it is sent as
+  asked (default 0.7), and if the API answers a non-retryable 400 that mentions `temperature`, the provider drops it,
+  prints one warning on stderr and repeats the call once without it (and omits it from then on). The temperature
+  actually sent is recorded (`null` if none), so old 0.7 runs and new no-temperature runs are separate leaderboard rows.
+  Pass `--temperature none` to send none anywhere. Via OpenRouter the temperature is still sent as before.
+- **Tool choice (`--format tools`).** Forced tool choice (`{"type": "any"}`) is a 400 on Opus 5.5, Sonnet 5.5, Fable 5.1 and
+  5.2 and Mythos, so those get `{"type": "auto"}`, both direct and as `openrouter:anthropic/...` (which sends `"auto"`).
+  Other models keep the forced choice. A model that then answers in text goes through the usual repair path.
+- **Thinking.** Not configured: the 5.x models think adaptively by default (`budget_tokens` and `{"type": "disabled"}` are
+  400s on them). Thinking blocks are ignored and history is plain text, as always. Thinking tokens are billed as output.
+- **max_tokens.** Thinking tokens count against it. `--max-tokens` defaults to 16000 for `anthropic:` specs and whenever an
+  effort is sent, else 1024. The effective value is recorded.
+- **Timeouts.** Calls are not streamed, and a high-effort turn can take minutes, so the HTTP read timeout is 600 s for
+  `anthropic:` and for any call that sends an effort (120 s otherwise). A timeout is retried, and the retry is billed.
 
 ## Commands
 
@@ -67,7 +116,7 @@ empty too, the harness plays `look` and records a parse failure (raise `--max-to
 brass-lantern games
 brass-lantern play  --game zork1 --model SPEC [--max-turns 150] [--max-cost 0.5] [--max-time 900]
                     [--history 30] [--notes] [--cache on|off] [--format text|tools]
-                    [--temperature 0.7|none] [--max-tokens 1024]
+                    [--temperature 0.7|none] [--effort low|...|max] [--max-tokens N] [--prices FILE]
                     [--base-url URL] [--out runs] [--quiet] [--seed-meta KEY=VALUE]
 brass-lantern bench --models a,b,c --games x,y --runs 3 --concurrency 4 \
                     --max-cost-per-run 0.50 --out runs/bench-demo
@@ -78,8 +127,9 @@ brass-lantern report runs/bench-demo
 
 - `--games all` benchmarks every available game on the server.
 - `--seed-meta KEY=VALUE` (repeatable) adds fields to the metadata Grue stores with the session.
-- `--temperature` defaults to 0.7 and is recorded in every run. Pass `none` to omit it for models that reject it
-  (e.g. some reasoning models).
+- `--temperature` defaults to 0.7. Pass `none` to omit it. It is left out automatically where a model is known to reject
+  it (see [Direct Anthropic and OpenAI runs](#direct-anthropic-and-openai-runs)); the value actually sent is recorded.
+- `--max-tokens` defaults to 16000 for `anthropic:` specs or when an effort is sent, else 1024.
 - `bench` interleaves repeats so an interrupted bench still covers every model and game evenly. Ctrl-C ends all
   live sessions cleanly and writes the leaderboard for whatever finished.
 - **Resuming a bench.** A bench saves its settings in `<out>/bench.json` when it starts. If it is interrupted (Ctrl-C, a
@@ -137,8 +187,8 @@ only 1 of 44 turns at these prompt sizes (1-4k tokens), and explicit breakpoints
 Cache activity is read from each provider's usage block (`cache_read_tokens` and `cache_write_tokens`; `input_tokens` is
 still the whole prompt) and recorded in `run.json` totals, in each transcript line, and as `cache hit N%` in the final
 summary line when the provider reported any. OpenRouter's `usage.cost` already includes the cache discount. When cost is
-estimated from `--prices`, cache reads are billed at 0.1x the input price and cache writes at 1.25x (Anthropic's rates;
-approximate for other providers). `cache` and the window step are recorded in `run.json`, and a bench labels rows that
+estimated from the price table, cache reads and writes are billed at their own rates (see [Cost controls](#cost-controls)).
+`cache` and the window step are recorded in `run.json`, and a bench labels rows that
 differ in them, e.g. `openrouter:x (no cache)`. Runs made before this option count as `--cache off`.
 
 ## Answer format (`--format text|tools`, default text)
@@ -150,8 +200,8 @@ so playing ability can be measured apart from format-following (some models fail
   `command` (required) and, with `--notes`, an optional `notes` argument that replaces the stored notes (`NOTES:` lines
   in the text are ignored in this mode).
 - OpenAI-compatible providers send `tools` with `tool_choice: "required"`; Anthropic sends `tool_choice: {"type": "any"}`
-  (`auto` if extended thinking is on); Gemini uses `functionCallingConfig` mode `ANY`. `mock:` and `human:` ignore tools
-  and answer in text.
+  (`auto` for the models that reject a forced choice, and when extended thinking is on); Gemini uses
+  `functionCallingConfig` mode `ANY`. `mock:` and `human:` ignore tools and answer in text.
 - The command comes from the first `act` call, cleaned and capped at 120 characters like text commands. With no usable
   call the agent makes one repair request asking for the tool call and counts a **parse failure**. If the text still
   has an explicit `> command` line, that is used instead (no repair call). Last resorts: the last line of the text, then
@@ -167,10 +217,13 @@ so playing ability can be measured apart from format-following (some models fail
 
 Each episode writes `runs/<run_id>/` (run ids look like `20261112-210000-zork1-openrouter-anthropic-claude-haiku-4.5-a1b2`):
 
-- `run.json`: config (including provider settings and the metadata sent to Grue), model, game, session id, status
+- `run.json`: config (including provider settings, the effective `effort`, `temperature` and `max_tokens`, and the
+  metadata sent to Grue), model (with any `@effort`), game, session id, `report` (whether Grue accepted the
+  [run report](#report-to-grue)), status
   (`completed` | `interrupted` | `error`), stop reason (`game_over`, `max_turns`, `max_cost`, `max_time`,
   `max_calls`, `provider_error`, `grue_error`, `interrupted`, `error`), Grue's final `Result`, and totals: turns, score, max score,
-  ending, input/output tokens, cache read/write tokens and hit rate, cost, wall time, parse failures, invalid commands.
+  ending, input/output tokens, cache read/write tokens and hit rate, cost and `cost_source` (`provider`, `prices` or
+  `null`), wall time, parse failures, invalid commands.
 - `transcript.jsonl`: one line per turn with the observation the model saw, the raw model reply, the command sent,
   parse method, tokens (including cache reads and writes), any tool calls, cost, latency and finish reason; plus a final
   line with the last observation.
@@ -196,8 +249,8 @@ A bench also writes `bench.json` (its settings, with `"version": 1`, used by `--
 - **Excluded runs** hit a harness problem (`grue_error`, `interrupted`, `error`, still `running`, or a `provider_error`
   before the first turn). They are left out of scores, counted in the "excl." column and listed with their reason in the
   "Excluded runs" section of `leaderboard.md` (and `excluded_reason` in `results.csv`). Their cost still counts.
-- **Configurations:** runs are grouped by model spec **and** the settings that change behaviour (temperature, history,
-  notes, reasoning, max tokens, max turns, cache, format). If one spec was run with different settings, each configuration is its own
+- **Configurations:** runs are grouped by model spec (including any `@effort`) **and** the settings that change behaviour
+  (temperature as sent, history, notes, effort, max tokens, max turns, cache, format). If one spec was run with different settings, each configuration is its own
   row, labelled with the settings that differ, e.g. `openrouter:x (notes, h=30)`. Identical configurations merge.
 - **Win rate** = share of runs Grue ended as `won`. Games often end by `turn_limit` instead, so score is the main signal.
 - **Invalid %** = parser rejections per command, as counted by Grue. **Format fail %** = replies without a `> COMMAND` line.
@@ -207,16 +260,40 @@ A bench also writes `bench.json` (its settings, with `"version": 1`, used by `--
 - `--max-cost` (play) / `--max-cost-per-run` (bench) stop an episode when spend reaches the cap, then end the session.
   The check runs before each model call and again right after a call that pushes spend over the cap, so no further turns
   are sent; the stop reason is `max_cost`. A format-repair call that fails still bills the call that preceded it.
-  OpenRouter reports real costs. Other providers report only tokens, so supply `--prices prices.json` to estimate cost
-  (and make the cap work): `{"anthropic:claude-sonnet-4-5": {"input": 3.0, "output": 15.0}}` (USD per million tokens).
+  OpenRouter reports real costs. Other providers report only tokens, so cost is estimated from a price table (USD per
+  million tokens). A provider-reported cost always wins, and each run records `cost_source`: `provider`, `prices` or `null`.
+- **Bundled price table.** `brass_lantern/prices.json` ships with current Claude and OpenAI chat models, keyed by the
+  spec you type (`anthropic:claude-sonnet-5-5`, `openai:gpt-6.1-sol`), so `--max-cost` works for direct `anthropic:` and
+  `openai:` runs out of the box. It was generated from OpenRouter's public model list; refresh it with
+  `python scripts/update_prices.py` (free, no key; stdlib only). A spec with an `@effort` suffix uses its base model's price.
+- **`--prices FILE`** overrides or extends the bundled table. An entry is `{"input", "output", "cache_read", "cache_write"}`
+  in USD per million tokens, for example
+  `{"anthropic:claude-sonnet-5-5": {"input": 2, "output": 10, "cache_read": 0.1, "cache_write": 2.5}}`. The old
+  `{"input": 3.0, "output": 15.0}` form still works; the cache is then priced at 0.1x (reads) and 1.25x (writes) of input.
+  Cost per call = uncached input x input + cache reads x cache_read + cache writes x cache_write + output x output.
+  Estimates are approximate: check the table against your provider's price page before a big spend.
 - **`bench --max-cost-per-run` refuses to start** (exit code 2) if any model reports no dollar cost (anything except
-  `openrouter:`, `mock:`, `human:`) and has no entry in `--prices`: the cap would be silently inert, and spending without
-  an effective cap is the dangerous direction. The error names the models. `play --max-cost` only warns in that case, and
-  cost shows as `n/a`.
+  `openrouter:`, `mock:`, `human:`) and has no price in the bundled table or `--prices`: the cap would be silently inert,
+  and spending without an effective cap is the dangerous direction. The error names the models. `play --max-cost` only
+  warns in that case, and cost shows as `n/a`. A bench saves the prices of its models in `bench.json`.
 - `--max-turns`, `--max-time` and `--history` bound the rest. Model calls are also capped at `3 * max-turns` per episode
   (stop reason `max_calls`), in case Grue stops advancing `turn` (for example while it reports a command as not sent
-  because the game is still busy). Keep `--max-tokens` small unless you test reasoning models.
+  because the game is still busy). Thinking models need a large `--max-tokens` (the default is 16000 for them).
 - Use `mock:` for dry runs; they cost nothing.
+
+## Report to Grue
+
+Grue sees the settings and, afterwards, the client-side stats of every run:
+
+- At session start the `meta` carries `agent`, `model` (the spec without `@effort`), `effort` (as sent, or `null`),
+  `format`, `cache`, `history`, `history_step`, `notes`, `max_tokens`, `temperature` (as sent, or `null`), `run_id`, and
+  `bench` and `repeat` in a bench, plus any `--seed-meta`.
+- When an episode ends, whatever its status, `POST /api/sessions/{id}/report` sends `{"client_report": {...}}` with
+  `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cost_usd`, `cost_source`, `model_time_s`,
+  `parse_failures`, `provider_errors`, `stop_reason`, `status` and `client_version`. Grue accepts one report per finished
+  session. Runs that never got a session id send none.
+- Any failure (a 404 from a Grue that has no such endpoint, a 409, the network) is one warning line on stderr. It never
+  changes the run's status or the exit code. `run.json` records `"report": {"accepted": true|false, "error": ...}`.
 
 ## Connection handling
 
@@ -250,7 +327,7 @@ python -m pytest -q
 ```
 
 No network or paid calls: providers are tested with `httpx.MockTransport`, and the runner and bench run against an
-in-memory fake Grue (`tests/fake_grue.py`).
+in-memory fake Grue (`tests/fake_grue.py`, which also implements the report endpoint).
 
 ## License
 

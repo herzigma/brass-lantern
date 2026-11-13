@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
+
 from brass_lantern.providers.base import (
     CACHE_CONTROL,
     Completion,
@@ -15,6 +17,7 @@ from brass_lantern.providers.base import (
     tool_call,
     with_cache_breakpoint,
 )
+from brass_lantern.providers.models import LONG_READ_TIMEOUT_S, anthropic_rejects_forced_tool_choice
 
 ANTHROPIC_URL = "https://api.anthropic.com"
 API_VERSION = "2023-06-01"
@@ -32,6 +35,9 @@ class AnthropicProvider(HTTPProvider):
         extra_body: dict[str, Any] | None = None,  # e.g. {"thinking": {...}}, merged into every request
         **kwargs: Any,
     ):
+        # Thinking is adaptive and on by default on the 5.x models, and a high-effort turn can take
+        # minutes: wait for it instead of timing out (a timeout is retried, and the retry is billed).
+        kwargs.setdefault("timeout", httpx.Timeout(LONG_READ_TIMEOUT_S, connect=30.0))
         super().__init__(model, base_url=base_url, **kwargs)
         self._extra_body = dict(extra_body or {})
         self._headers = {
@@ -57,16 +63,20 @@ class AnthropicProvider(HTTPProvider):
             payload["system"] = [{"type": "text", "text": system, "cache_control": dict(CACHE_CONTROL)}]
             if msgs:
                 msgs[-1] = with_cache_breakpoint(msgs[-1])
-        if self.temperature is not None:
+        if self.temperature is not None:  # create_provider leaves it out for models that reject it
             payload["temperature"] = self.temperature
+        if self.effort:
+            payload["output_config"] = {"effort": self.effort}
         payload.update(self._extra_body)
         if tools:
             payload["tools"] = [
                 {"name": t["name"], "description": t.get("description", ""), "input_schema": t["parameters"]}
                 for t in tools
             ]
-            # Anthropic rejects a forced tool choice when extended thinking is on.
-            payload["tool_choice"] = {"type": "auto" if "thinking" in payload else "any"}
+            # Anthropic rejects a forced tool choice when extended thinking is on, and some models
+            # (Opus 5.5, Sonnet 5.5, Fable 5.1/5.2, Mythos) reject it outright.
+            forced = "thinking" not in payload and not anthropic_rejects_forced_tool_choice(self.model)
+            payload["tool_choice"] = {"type": "any" if forced else "auto"}
 
         try:
             data, latency = await self._post_json(f"{self.base_url}/v1/messages", self._headers, payload)

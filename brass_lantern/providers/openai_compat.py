@@ -18,6 +18,7 @@ from brass_lantern.providers.base import (
     tool_call,
     with_cache_breakpoint,
 )
+from brass_lantern.providers.models import anthropic_rejects_forced_tool_choice
 
 OPENAI_URL = "https://api.openai.com/v1"
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
@@ -103,9 +104,11 @@ class OpenAICompatProvider(HTTPProvider):
                 }
                 for t in tools
             ]
-            # Anthropic models reject a forced tool choice while reasoning is on (OpenRouter passes it through).
-            reasoning_on = "reasoning" in payload and self.model.lower().startswith("anthropic/")
-            payload["tool_choice"] = "auto" if reasoning_on else "required"
+            # Anthropic models reject a forced tool choice while reasoning is on, and some reject it
+            # outright (OpenRouter passes it through).
+            anthropic = self.model.lower().startswith("anthropic/")
+            no_force = anthropic and ("reasoning" in payload or anthropic_rejects_forced_tool_choice(self.model))
+            payload["tool_choice"] = "auto" if no_force else "required"
 
         try:
             data, latency = await self._post_json(f"{self.base_url}/chat/completions", self._headers, payload)

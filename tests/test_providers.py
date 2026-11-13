@@ -249,7 +249,7 @@ def test_anthropic_request_shape_system_split():
     assert req.headers["x-api-key"] == "sk-a" and req.headers["anthropic-version"] == "2023-06-01"
     assert body["system"] == SYSTEM
     assert body["messages"] == msgs  # no system role inside messages
-    assert body["max_tokens"] == 1024 and body["temperature"] == 0.7 and body["model"] == "claude-x"
+    assert body["max_tokens"] == 16000 and body["temperature"] == 0.7 and body["model"] == "claude-x"  # anthropic: room to think
     assert (c.text, c.input_tokens, c.output_tokens, c.cost_usd) == ("Plan.\n> take lamp", 50, 9, None)
 
 

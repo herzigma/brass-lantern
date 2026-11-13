@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import secrets
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -16,24 +17,24 @@ from brass_lantern import __version__
 from brass_lantern.agent import HISTORY_STEP, Agent
 from brass_lantern.console import Reporter
 from brass_lantern.grue_client import GrueClient, GrueError, Observation, Result
-from brass_lantern.providers import Completion, Provider, ProviderError
+from brass_lantern.prices import CACHE_READ_FACTOR, CACHE_WRITE_FACTOR, Price, as_price
+from brass_lantern.providers import Completion, ConfigError, Provider, ProviderError, parse_spec
 
 
 # Model calls per episode are capped at this multiple of max_turns, in case the server stops advancing turns.
 MAX_CALLS_FACTOR = 3
 DEFAULT_MAX_TURNS = 1000  # matches Grue's DEFAULT_MAX_TURNS, used if the server does not say
 
-# Price-table billing of cached prompt tokens, as multiples of the input price. These are Anthropic's
-# rates (cache reads 0.1x, 5-minute cache writes 1.25x); other providers differ, so for them the
-# estimate is approximate. Providers that report a dollar cost (OpenRouter) never use these.
-CACHE_READ_PRICE_FACTOR = 0.1
-CACHE_WRITE_PRICE_FACTOR = 1.25
+# Cache rates for a price given as just (input, output): multiples of the input price (Anthropic's
+# rates). Tables from prices.json carry explicit cache_read / cache_write prices instead.
+CACHE_READ_PRICE_FACTOR = CACHE_READ_FACTOR
+CACHE_WRITE_PRICE_FACTOR = CACHE_WRITE_FACTOR
 
 
 @dataclass
 class RunConfig:
     game: str
-    model: str  # the provider:model spec, recorded in run.json
+    model: str  # the provider:model[@effort] spec, recorded in run.json (Grue gets it without the @effort)
     max_turns: int | None = None  # None: the game's suggested limit (server decides)
     max_cost: float | None = None  # USD
     max_time: float | None = None  # seconds
@@ -41,26 +42,38 @@ class RunConfig:
     notes: bool = False
     format: str = "text"  # how the model answers: "text" (> COMMAND line) or "tools" (native act call)
     cache: bool = True  # prompt caching: stepped history window + provider cache hints
-    temperature: float | None = 0.7
+    temperature: float | None = 0.7  # as actually sent: None = not sent (the model's default)
     max_tokens: int = 1024
-    reasoning: str | None = None
+    effort: str | None = None  # as actually sent: None = the provider's default
     base_url: str | None = None  # provider endpoint override
     grue_url: str | None = None
     out_dir: Path = Path("runs")
     run_id: str | None = None
     quiet: bool = False
     meta: dict[str, Any] = field(default_factory=dict)  # extra session meta
-    price: tuple[float, float] | None = None  # (input, output) USD per 1M tokens, for providers without cost
+    # USD per 1M tokens, for providers that report no cost: a Price, or just (input, output)
+    price: Price | tuple[float, float] | None = None
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _spec_parts(model: str) -> tuple[str, str]:
+    """(spec without its @effort suffix, effort or ""); an unparseable spec comes back as it is."""
+    try:
+        spec = parse_spec(model)
+    except ConfigError:
+        return model, ""
+    return spec.base, spec.effort or ""
+
+
 def make_run_id(game: str, model: str) -> str:
+    model, effort = _spec_parts(model)  # the effort stays in the id: it tells two runs of one model apart
     if model.startswith("mock:"):  # a script path: keep just the file name
         model = "mock-" + Path(model[5:]).stem
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", model).strip("-")[:40]
+    slug = f"{slug}-{effort}" if effort else slug
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return f"{stamp}-{game}-{slug}-{secrets.token_hex(2)}"
 
@@ -89,8 +102,41 @@ class _Totals:
         self.cache_write_tokens = 0
         self.cost = 0.0
         self.cost_known = False
+        self.cost_sources: set[str] = set()  # "provider" and/or "prices"
         self.model_time = 0.0
         self.parse_failures = 0
+
+
+def client_report(summary: dict[str, Any]) -> dict[str, Any]:
+    """The flat ``client_report`` Grue stores with a finished session (numbers, short strings, bools, null)."""
+    t = summary["totals"]
+    return {
+        "input_tokens": t["input_tokens"],
+        "output_tokens": t["output_tokens"],
+        "cache_read_tokens": t["cache_read_tokens"],
+        "cache_write_tokens": t["cache_write_tokens"],
+        "cost_usd": t["cost_usd"],
+        "cost_source": t["cost_source"],
+        "model_time_s": t["model_time_s"],
+        "parse_failures": t["parse_failures"],
+        "provider_errors": 1 if summary["stop_reason"] == "provider_error" else 0,
+        "stop_reason": summary["stop_reason"],
+        "status": summary["status"],
+        "client_version": __version__,
+    }
+
+
+async def send_report(grue: GrueClient, session_id: str, report: dict[str, Any], run_id: str) -> dict[str, Any]:
+    """POST the client report. Never raises: a failure is one warning line on stderr, and is recorded."""
+    try:
+        await grue.report(session_id, report)
+        return {"accepted": True, "error": None}
+    except asyncio.CancelledError:  # a second Ctrl-C while reporting: give up quietly
+        problem = "interrupted before the report was sent"
+    except Exception as e:  # noqa: BLE001 - 404 from an older server, 409, network: none may change the run
+        problem = " ".join(str(e).split())[:200] or type(e).__name__
+    print(f"warning: {run_id}: Grue did not accept the run report ({problem})", file=sys.stderr)
+    return {"accepted": False, "error": problem}
 
 
 async def play_episode(
@@ -113,11 +159,19 @@ async def play_episode(
 
     meta = {
         "agent": f"brass-lantern/{__version__}",
-        "model": cfg.model,
-        "run_id": run_id,
+        "model": _spec_parts(cfg.model)[0],
+        "effort": cfg.effort,
+        "format": cfg.format,
+        "cache": cfg.cache,
+        "history": cfg.history,
+        "history_step": HISTORY_STEP if cfg.cache else 0,  # 0 = sliding window
+        "notes": cfg.notes,
+        "max_tokens": cfg.max_tokens,
         "temperature": cfg.temperature,
+        "run_id": run_id,
         **cfg.meta,
     }
+    price = as_price(cfg.price)
     started_at = now_iso()
     t0 = time.monotonic()
     totals = _Totals()
@@ -128,6 +182,7 @@ async def play_episode(
     status = "completed"
     error: str | None = None
     agent: Agent | None = None
+    report_state: dict[str, Any] | None = None  # set once the client report was attempted
 
     def build_summary(final: bool) -> dict[str, Any]:
         score = result.score if result and result.score is not None else (obs.score if obs else None)
@@ -154,9 +209,10 @@ async def play_episode(
                 "format": cfg.format,
                 "cache": cfg.cache,
                 "history_step": HISTORY_STEP if cfg.cache else 0,  # 0 = sliding window
-                "temperature": cfg.temperature,
+                # the temperature actually sent: None if it was never sent, or the API rejected it
+                "temperature": None if getattr(provider, "temperature_dropped", False) else cfg.temperature,
                 "max_tokens": cfg.max_tokens,
-                "reasoning": cfg.reasoning,
+                "effort": cfg.effort,
                 "provider": provider.describe(),
                 "meta": meta,
             },
@@ -174,6 +230,10 @@ async def play_episode(
                     round(totals.cache_read_tokens / totals.input_tokens, 4) if totals.input_tokens else None
                 ),
                 "cost_usd": round(totals.cost, 6) if totals.cost_known else None,
+                # "provider" = reported by the API; "prices" = estimated from the price table (any estimated call)
+                "cost_source": (
+                    None if not totals.cost_known else "prices" if "prices" in totals.cost_sources else "provider"
+                ),
                 "wall_time_s": round(time.monotonic() - t0, 2),
                 "model_time_s": round(totals.model_time, 2),
                 "parse_failures": totals.parse_failures,
@@ -181,20 +241,26 @@ async def play_episode(
                 "unique_locations": result.unique_locations if result else None,
             },
             "result": result.raw if result else None,
+            # {"accepted": bool, "error": str | None} once the client report to Grue was tried; None if never
+            # (the run got no session id, or is still running)
+            "report": report_state,
         }
 
     def bill(comp: Completion) -> float | None:
         """Add one model reply's tokens, time and cost (price table if the provider gave none)."""
         cost = comp.cost_usd
-        if cost is None and cfg.price:
+        if cost is not None:
+            totals.cost_sources.add("provider")
+        elif price:
             # input_tokens is the whole prompt, cached parts included: bill those at their own rates.
             plain = max(0, comp.input_tokens - comp.cache_read_tokens - comp.cache_write_tokens)
-            weighted = (
-                plain
-                + comp.cache_read_tokens * CACHE_READ_PRICE_FACTOR
-                + comp.cache_write_tokens * CACHE_WRITE_PRICE_FACTOR
-            )
-            cost = (weighted * cfg.price[0] + comp.output_tokens * cfg.price[1]) / 1e6
+            cost = (
+                plain * price.input
+                + comp.cache_read_tokens * price.cache_read
+                + comp.cache_write_tokens * price.cache_write
+                + comp.output_tokens * price.output
+            ) / 1e6
+            totals.cost_sources.add("prices")
         totals.input_tokens += comp.input_tokens
         totals.output_tokens += comp.output_tokens
         totals.cache_read_tokens += comp.cache_read_tokens
@@ -332,6 +398,8 @@ async def play_episode(
             except Exception as e:  # noqa: BLE001
                 error = error or f"could not fetch final result: {e}"
 
+    if session_id:  # whatever the status; a failure is a warning, never a change to the run
+        report_state = await send_report(grue, session_id, client_report(build_summary(True)), run_id)
     summary = write_run_json(final=True)
     reporter.end(summary)
     return summary

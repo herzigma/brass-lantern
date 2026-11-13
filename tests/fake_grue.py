@@ -30,6 +30,9 @@ class FakeGrue:
         self.seen_auth: list[str | None] = []
         self.deleted: list[str] = []
         self.stall_after_turn: int | None = None  # once reached, commands are "not sent" and turn stops advancing
+        self.report_endpoint = True  # False: act like an older server that has no /report route (404 not_found)
+        self.read_only: set[str] = set()  # session ids that behave like featured results (report -> 409 read_only)
+        self.reports: dict[str, dict] = {}  # session id -> accepted client_report
         self._n = 0
 
     # -- plumbing ----------------------------------------------------------
@@ -65,6 +68,9 @@ class FakeGrue:
         m = re.fullmatch(r"/api/sessions/([^/]+)/commands", path)
         if m and request.method == "POST":
             return self._command(m.group(1), (body or {}).get("command", ""))
+        m = re.fullmatch(r"/api/sessions/([^/]+)/report", path)
+        if m and request.method == "POST" and self.report_endpoint:
+            return self._report(m.group(1), body)
         m = re.fullmatch(r"/api/sessions/([^/]+)", path)
         if m and request.method == "GET":
             s = self.sessions.get(m.group(1))
@@ -84,6 +90,29 @@ class FakeGrue:
             r = self.results.get(m.group(1))
             return self._json(200, r) if r else self._err(404, "unknown_session")
         return self._err(404, "not_found")
+
+    # -- run stats report (contract: POST /api/sessions/{id}/report) --------
+
+    def _report(self, sid: str, body: dict | None) -> httpx.Response:
+        if sid in self.sessions and sid not in self.results:
+            return self._err(409, "session_active")
+        result = self.results.get(sid)
+        if result is None:
+            return self._err(404, "unknown_session")
+        if sid in self.read_only:
+            return self._err(409, "read_only")
+        if "client_report" in result:
+            return self._err(409, "already_reported")
+        report = (body or {}).get("client_report")
+        ok = isinstance(report, dict) and len(json.dumps(report).encode()) <= 4096 and all(
+            v is None or isinstance(v, (bool, int, float)) or (isinstance(v, str) and len(v) <= 200)
+            for v in report.values()
+        )
+        if not ok:
+            return self._err(400, "bad_request", "client_report must be a flat object of numbers, short strings, bools or null")
+        result["client_report"], result["client_report_at"] = report, _now()
+        self.reports[sid] = report
+        return self._json(200, result)
 
     # -- game logic --------------------------------------------------------
 

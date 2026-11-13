@@ -19,18 +19,22 @@ from brass_lantern.bench import (
 )
 from brass_lantern.console import setup_stdio
 from brass_lantern.grue_client import GrueClient, GrueError
-from brass_lantern.providers import ConfigError, create_provider, split_spec
+from brass_lantern.prices import Price, load_price_file, load_prices, price_for, prices_for_models
+from brass_lantern.providers import EFFORTS, ConfigError, create_provider, resolve_settings, split_spec
 from brass_lantern.runner import RunConfig, play_episode
 
 EPILOG = """\
 model specs (provider:model):
   openrouter:anthropic/claude-haiku-4.5   OPENROUTER_API_KEY; reports real dollar cost
-  openai:gpt-4o-mini                      OPENAI_API_KEY (add --base-url for vLLM, LM Studio, Together, ...)
+  openai:gpt-6.1-sol                      OPENAI_API_KEY (add --base-url for vLLM, LM Studio, Together, ...)
   ollama:llama3.1:8b                      local Ollama, no key
-  anthropic:claude-sonnet-4-5             ANTHROPIC_API_KEY
+  anthropic:claude-sonnet-5-5             ANTHROPIC_API_KEY
   gemini:gemini-2.5-flash                 GEMINI_API_KEY
   mock:script.txt                         replay commands from a file (dry runs, no API calls)
   human:                                  type the commands yourself (debugging the harness)
+
+reasoning effort per model: append @minimal|@low|@medium|@high|@xhigh|@max to a spec, e.g.
+  anthropic:claude-sonnet-5-5@high        overrides --effort for that spec (a bench treats @low and @high as two models)
 
 environment: GRUE_URL (default http://127.0.0.1:8081), GRUE_API_KEY; values may live in a .env file.
 """
@@ -56,27 +60,12 @@ def _kv(value: str) -> tuple[str, str]:
     return key, val
 
 
-def load_prices(path: str | None) -> dict[str, tuple[float, float]]:
-    """Read ``{"provider:model": {"input": 3.0, "output": 15.0}}`` (USD per 1M tokens)."""
-    if not path:
-        return {}
-    try:
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
-        out = {}
-        for spec, p in raw.items():
-            inp, outp = (p["input"], p["output"]) if isinstance(p, dict) else p
-            out[spec] = (float(inp), float(outp))
-        return out
-    except (OSError, ValueError, KeyError, TypeError) as e:
-        raise ConfigError(f"Cannot read prices file {path!r}: {e}") from e
+COST_REPORTING_PROVIDERS = ("openrouter", "mock", "human")  # providers whose cap works without a price table
 
 
-COST_REPORTING_PROVIDERS = ("openrouter", "mock", "human")  # providers whose cap works without --prices
-
-
-def uncapped_models(models: Sequence[str], prices: dict[str, tuple[float, float]]) -> list[str]:
-    """Specs for which a dollar cap cannot work: no provider-reported cost and no --prices entry."""
-    return [m for m in models if split_spec(m)[0] not in COST_REPORTING_PROVIDERS and m not in prices]
+def uncapped_models(models: Sequence[str], prices: dict[str, Price]) -> list[str]:
+    """Specs for which a dollar cap cannot work: no provider-reported cost and no price (bundled or --prices)."""
+    return [m for m in models if split_spec(m)[0] not in COST_REPORTING_PROVIDERS and price_for(prices, m) is None]
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
@@ -94,12 +83,17 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                         "a native 'act' tool instead, separating playing ability from format-following")
     p.add_argument("--temperature", type=_temperature, default=0.7,
                    help="sampling temperature (default: 0.7); 'none' omits it, for models that reject it")
-    p.add_argument("--max-tokens", type=int, default=1024, help="max output tokens per reply (default: 1024)")
-    p.add_argument("--reasoning", choices=["minimal", "low", "medium", "high"],
-                   help="reasoning effort for reasoning models (openrouter, openai); default: provider default")
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help="max output tokens per reply (default: 16000 for anthropic or when an effort is sent, "
+                        "else 1024; thinking tokens count against it)")
+    p.add_argument("--effort", choices=EFFORTS,
+                   help="reasoning effort (anthropic, openai, openrouter; default: the provider default). "
+                        "A spec @effort suffix overrides it, e.g. anthropic:claude-sonnet-5-5@high")
+    p.add_argument("--reasoning", choices=EFFORTS, help="deprecated alias of --effort")
     p.add_argument("--base-url", help="override the provider's API base URL (e.g. a vLLM or LM Studio server)")
     p.add_argument("--prices", metavar="FILE",
-                   help="JSON of per-model USD/1M-token prices, so --max-cost works for providers that report no cost")
+                   help="JSON of per-model USD/1M-token prices that override or extend the bundled table "
+                        "(brass_lantern/prices.json), so --max-cost works for providers that report no cost")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -168,13 +162,15 @@ async def _games(args: argparse.Namespace) -> int:
 async def _play(args: argparse.Namespace) -> int:
     prices = load_prices(args.prices)
     provider = create_provider(args.model, base_url=args.base_url, temperature=args.temperature, max_tokens=args.max_tokens,
-                               reasoning=args.reasoning, cache=args.cache == "on")
+                               effort=args.effort, cache=args.cache == "on")
+    sent = resolve_settings(args.model, effort=args.effort, temperature=args.temperature, max_tokens=args.max_tokens,
+                            base_url=args.base_url)  # what is really sent: this is what gets recorded
     cfg = RunConfig(
         game=args.game, model=args.model, max_turns=args.max_turns, max_cost=args.max_cost, max_time=args.max_time,
         history=args.history, notes=args.notes, format=args.format, cache=args.cache == "on",
-        temperature=args.temperature, max_tokens=args.max_tokens, reasoning=args.reasoning,
+        temperature=sent.temperature, max_tokens=sent.max_tokens, effort=sent.effort,
         base_url=args.base_url, grue_url=args.grue_url, out_dir=Path(args.out), run_id=args.run_id,
-        quiet=args.quiet, meta=dict(args.seed_meta), price=prices.get(args.model),
+        quiet=args.quiet, meta=dict(args.seed_meta), price=price_for(prices, args.model),
     )
     if cfg.max_cost is not None and provider.name not in ("openrouter", "mock", "human") and not cfg.price:
         print(f"warning: {args.model} reports no dollar cost, so --max-cost will not stop the run "
@@ -188,11 +184,12 @@ async def _play(args: argparse.Namespace) -> int:
     return {"completed": 0, "interrupted": 130}.get(summary["status"], 1)
 
 
-def _require_enforceable_cap(max_cost: float | None, models: Sequence[str], prices: dict[str, tuple[float, float]]) -> None:
+def _require_enforceable_cap(max_cost: float | None, models: Sequence[str], prices: dict[str, Price]) -> None:
     if max_cost is not None and (bad := uncapped_models(models, prices)):
         raise ConfigError(  # spending without an effective cap is the dangerous direction: refuse to start
             f"--max-cost-per-run cannot be enforced for {', '.join(bad)}: the provider reports no dollar cost "
-            "and --prices has no entry for it. Add the model to a --prices file, or drop --max-cost-per-run."
+            "and neither the bundled prices nor --prices has an entry for it. Add the model to a --prices file, "
+            "or drop --max-cost-per-run."
         )
 
 
@@ -226,10 +223,14 @@ async def _bench_resume(args: argparse.Namespace) -> int:
         if value is not None and value != getattr(cfg, name):
             overrides[name] = value
             setattr(cfg, name, value)
-    if args.prices:
-        new_prices = load_prices(args.prices)
-        cfg.prices = {**cfg.prices, **new_prices}
-        overrides["prices"] = sorted(new_prices)
+    file_prices = load_price_file(args.prices) if args.prices else {}
+    if file_prices:
+        overrides["prices"] = sorted(file_prices)
+    bundled = load_prices()
+    for spec in cfg.models:  # --prices beats what bench.json saved; models it saved no price for get the bundled one
+        price = price_for(file_prices, spec) or price_for(cfg.prices, spec) or price_for(bundled, spec)
+        if price is not None:
+            cfg.prices[spec] = price
     _require_enforceable_cap(cfg.max_cost_per_run, cfg.models, cfg.prices)
 
     jobs, total = plan_resume(cfg, load_runs(out))
@@ -262,7 +263,7 @@ async def _bench(args: argparse.Namespace) -> int:
             max_cost_per_run=args.max_cost_per_run, max_time_per_run=args.max_time_per_run, history=args.history,
             notes=args.notes, format=args.format, cache=args.cache == "on", temperature=args.temperature,
             max_tokens=args.max_tokens, base_url=args.base_url,
-            reasoning=args.reasoning, grue_url=args.grue_url, out_dir=out, prices=prices,
+            effort=args.effort, grue_url=args.grue_url, out_dir=out, prices=prices_for_models(prices, args.models),
         )
         total = len(cfg.models) * len(cfg.games) * cfg.runs
         print(f"bench: {len(cfg.models)} models x {len(cfg.games)} games x {cfg.runs} runs = {total} episodes "
@@ -311,6 +312,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "bench":
         _check_bench_args(parser, args)
+    if getattr(args, "reasoning", None):
+        print("warning: --reasoning is deprecated; use --effort.", file=sys.stderr)
+        args.effort = args.effort or args.reasoning
     try:
         if args.command == "report":
             return _report(args)

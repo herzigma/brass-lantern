@@ -5,6 +5,7 @@ import pytest
 import brass_lantern.__main__ as cli
 from brass_lantern import __version__
 from brass_lantern.grue_client import GrueClient
+from brass_lantern.prices import Price
 from fake_grue import WIN_SCRIPT
 
 
@@ -106,8 +107,11 @@ def test_bench_games_all_uses_available_games(patched_grue, tmp_path, capsys):
 def test_prices_file(tmp_path):
     f = tmp_path / "p.json"
     f.write_text(json.dumps({"a:b": {"input": 1, "output": 2}, "c:d": [3, 4]}), encoding="utf-8")
-    assert cli.load_prices(str(f)) == {"a:b": (1.0, 2.0), "c:d": (3.0, 4.0)}
-    assert cli.load_prices(None) == {}
+    table = cli.load_prices(str(f))
+    # the old two-number format falls back to 0.1x / 1.25x of the input price for the cache
+    assert table["a:b"] == pytest.approx(Price(1.0, 2.0, 0.1, 1.25)) and table["c:d"] == pytest.approx((3.0, 4.0, 0.3, 3.75))
+    assert "anthropic:claude-sonnet-5-5" in table  # the bundled table is always loaded
+    assert "a:b" not in cli.load_prices(None)
     f.write_text("nope", encoding="utf-8")
     with pytest.raises(cli.ConfigError):
         cli.load_prices(str(f))

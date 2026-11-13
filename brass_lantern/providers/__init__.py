@@ -8,32 +8,31 @@ from typing import Any, Mapping
 import httpx
 
 from brass_lantern.providers.base import Completion, ConfigError, Provider, ProviderError
+from brass_lantern.providers.models import (
+    EFFORTS,
+    LONG_READ_TIMEOUT_S,
+    PROVIDER_NAMES,
+    ModelSpec,
+    Settings,
+    parse_spec,
+    resolve_settings,
+    split_spec,
+)
 
 __all__ = [
     "Completion",
     "ConfigError",
+    "EFFORTS",
+    "ModelSpec",
     "PROVIDER_NAMES",
     "Provider",
     "ProviderError",
+    "Settings",
     "create_provider",
+    "parse_spec",
+    "resolve_settings",
     "split_spec",
 ]
-
-PROVIDER_NAMES = ("openrouter", "openai", "ollama", "anthropic", "gemini", "mock", "human")
-
-
-def split_spec(spec: str) -> tuple[str, str]:
-    """Split ``provider:model`` on the *first* colon (models may contain colons)."""
-    provider, sep, model = spec.strip().partition(":")
-    provider = provider.lower()
-    if not sep or provider not in PROVIDER_NAMES:
-        raise ConfigError(
-            f"Bad model spec {spec!r}. Use provider:model with provider one of "
-            f"{', '.join(PROVIDER_NAMES)} (e.g. openrouter:anthropic/claude-haiku-4.5)."
-        )
-    if not model.strip() and provider != "human":
-        raise ConfigError(f"Model spec {spec!r} is missing the model name after the colon.")
-    return provider, model.strip()
 
 
 def _key(env: Mapping[str, str], var: str, provider: str) -> str:
@@ -48,14 +47,20 @@ def create_provider(
     *,
     base_url: str | None = None,
     temperature: float | None = 0.7,
-    max_tokens: int = 1024,
-    reasoning: str | None = None,
+    max_tokens: int | None = None,
+    effort: str | None = None,
+    reasoning: str | None = None,  # deprecated alias of effort
     cache: bool = True,
     env: Mapping[str, str] | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     sleep: Any = None,
 ) -> Provider:
-    """Build a provider from a spec like ``openrouter:openai/gpt-4o-mini``.
+    """Build a provider from a spec like ``openrouter:openai/gpt-4o-mini`` or ``anthropic:claude-opus-5-5@high``.
+
+    The spec's ``@effort`` suffix overrides ``effort``. ``temperature``, ``effort`` and ``max_tokens`` are
+    what was asked for; what is really sent follows :func:`resolve_settings` (models that reject a
+    temperature get none, ``max_tokens=None`` picks 16000 or 1024), and the provider's ``temperature``,
+    ``effort`` and ``max_tokens`` attributes hold the effective values.
 
     ``base_url`` overrides the provider's endpoint (this is how ``openai:`` talks to
     vLLM / LM Studio / Together). ``env`` defaults to ``os.environ``. Note that
@@ -64,6 +69,10 @@ def create_provider(
     """
     env = os.environ if env is None else env
     provider, model = split_spec(spec)
+    settings = resolve_settings(
+        spec, effort=effort or reasoning, temperature=temperature, max_tokens=max_tokens, base_url=base_url
+    )
+    temperature, max_tokens, effort = settings.temperature, settings.max_tokens, settings.effort
 
     if provider == "mock":
         from brass_lantern.providers.scripted import ScriptedProvider
@@ -79,7 +88,10 @@ def create_provider(
 
     common: dict[str, Any] = {
         "temperature": temperature, "max_tokens": max_tokens, "cache": cache, "transport": transport,
+        "effort": effort,
     }
+    if effort:  # reasoning turns are slow: do not time out (and retry, and re-bill) at the 120 s default
+        common["timeout"] = httpx.Timeout(LONG_READ_TIMEOUT_S, connect=30.0)
     if sleep is not None:
         common["sleep"] = sleep
 
@@ -115,7 +127,7 @@ def create_provider(
             },
             # usage.include makes OpenRouter return usage.cost in USD; reasoning.effort is
             # OpenRouter's vendor-neutral control for reasoning models.
-            extra_body={"usage": {"include": True}, **({"reasoning": {"effort": reasoning}} if reasoning else {})},
+            extra_body={"usage": {"include": True}, **({"reasoning": {"effort": effort}} if effort else {})},
             **common,
         )
     if provider == "ollama":
@@ -131,7 +143,7 @@ def create_provider(
         model,
         base_url=OPENAI_URL,
         api_key=_key(env, "OPENAI_API_KEY", provider),
-        extra_body={"reasoning_effort": reasoning} if reasoning else None,
+        extra_body={"reasoning_effort": effort} if effort else None,
         name="openai",
         token_param="max_completion_tokens",  # newer OpenAI models reject max_tokens
         **common,

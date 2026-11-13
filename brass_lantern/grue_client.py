@@ -222,3 +222,7 @@ class GrueClient:
 
     async def get_result(self, session_id: str) -> Result:
         return _build(Result, await self._request("GET", f"/api/results/{session_id}"))
+
+    async def report(self, session_id: str, client_report: dict[str, Any]) -> dict[str, Any]:
+        """Attach the client's run stats to a finished session (once). Never retried: it is a POST."""
+        return await self._request("POST", f"/api/sessions/{session_id}/report", {"client_report": client_report})

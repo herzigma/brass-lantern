@@ -17,7 +17,9 @@ from typing import Any, Callable
 from brass_lantern import __version__
 from brass_lantern.console import Reporter, fmt_cost, fmt_duration
 from brass_lantern.grue_client import GrueClient
-from brass_lantern.providers import ConfigError, Provider, create_provider
+from brass_lantern.prices import Price, parse_prices, price_for
+from brass_lantern.providers import ConfigError, Provider, Settings, create_provider, resolve_settings
+from brass_lantern.providers.models import DEFAULT_MAX_TOKENS
 from brass_lantern.runner import RunConfig, make_run_id, play_episode
 
 # Runs that did not finish for infrastructure reasons say nothing about the model
@@ -38,13 +40,23 @@ class BenchConfig:
     notes: bool = False
     format: str = "text"  # "text" (> COMMAND line) or "tools" (native act tool call)
     cache: bool = True  # prompt caching: stepped history window + provider cache hints
-    temperature: float | None = 0.7
-    max_tokens: int = 1024
-    reasoning: str | None = None
+    temperature: float | None = 0.7  # as asked for; each spec's effective value is worked out per model
+    max_tokens: int | None = None  # None: 16000 for Anthropic or when an effort is sent, else 1024
+    effort: str | None = None  # the default for specs without an @effort suffix
     base_url: str | None = None
     grue_url: str | None = None
     out_dir: Path = Path("runs")
-    prices: dict[str, tuple[float, float]] = field(default_factory=dict)  # model spec -> USD per 1M tokens
+    prices: dict[str, Price] = field(default_factory=dict)  # model spec -> USD per 1M tokens
+
+
+def _sent_settings(cfg: BenchConfig, spec: str) -> Settings:
+    """What is really sent for *spec*: @effort beats --effort, and some models take no temperature."""
+    try:
+        return resolve_settings(
+            spec, effort=cfg.effort, temperature=cfg.temperature, max_tokens=cfg.max_tokens, base_url=cfg.base_url
+        )
+    except ConfigError:  # create_provider already refused a bad spec; only a custom provider_factory gets here
+        return Settings(cfg.effort, cfg.temperature, cfg.max_tokens or DEFAULT_MAX_TOKENS)
 
 
 ProviderFactory = Callable[..., Provider]
@@ -70,7 +82,7 @@ async def run_bench(
     def make_provider(spec: str) -> Provider:
         return provider_factory(
             spec, base_url=cfg.base_url, temperature=cfg.temperature, max_tokens=cfg.max_tokens,
-            reasoning=cfg.reasoning, cache=cfg.cache,
+            effort=cfg.effort, cache=cfg.cache,
         )
 
     fresh = jobs is None
@@ -91,6 +103,7 @@ async def run_bench(
 
     async def worker(i: int, game: str, spec: str) -> None:
         async with sem:
+            sent = _sent_settings(cfg, spec)
             run_cfg = RunConfig(
                 game=game,
                 model=spec,
@@ -101,16 +114,16 @@ async def run_bench(
                 notes=cfg.notes,
                 format=cfg.format,
                 cache=cfg.cache,
-                temperature=cfg.temperature,
-                max_tokens=cfg.max_tokens,
-                reasoning=cfg.reasoning,
+                temperature=sent.temperature,
+                max_tokens=sent.max_tokens,
+                effort=sent.effort,
                 base_url=cfg.base_url,
                 grue_url=cfg.grue_url,
                 out_dir=out,
                 run_id=make_run_id(game, spec),
                 quiet=True,
                 meta={"bench": out.name, "repeat": i + 1},
-                price=cfg.prices.get(spec),
+                price=price_for(cfg.prices, spec),
             )
             provider = make_provider(spec)
             try:
@@ -151,7 +164,8 @@ def bench_fields(cfg: BenchConfig) -> dict[str, Any]:
     """Every BenchConfig field as plain JSON, except out_dir (a bench lives wherever bench.json is)."""
     data = dataclasses.asdict(cfg)
     data.pop("out_dir", None)
-    return json.loads(json.dumps(data, default=str))  # tuples become lists, Paths become strings
+    data["prices"] = {m: p._asdict() for m, p in cfg.prices.items()}
+    return json.loads(json.dumps(data, default=str))  # Paths become strings
 
 
 def new_bench_json(cfg: BenchConfig) -> dict[str, Any]:
@@ -193,12 +207,14 @@ def config_from_bench_json(data: dict[str, Any], directory: str | Path) -> Bench
     """Rebuild a BenchConfig: unknown keys are ignored, missing ones take the dataclass defaults."""
     known = {f.name for f in dataclasses.fields(BenchConfig)} - {"out_dir"}
     kwargs = {k: v for k, v in data.items() if k in known}
+    if "effort" not in kwargs and data.get("reasoning"):  # bench.json from before --effort
+        kwargs["effort"] = data["reasoning"]
     absent = [k for k in ("models", "games") if not kwargs.get(k)]
     if absent:
         raise ConfigError(f"{Path(directory) / BENCH_JSON} has no {' or '.join(absent)}; cannot resume.")
     try:
-        kwargs["prices"] = {m: (float(p[0]), float(p[1])) for m, p in (kwargs.get("prices") or {}).items()}
-    except (TypeError, ValueError, IndexError, AttributeError) as e:
+        kwargs["prices"] = parse_prices(kwargs.get("prices") or {}, str(Path(directory) / BENCH_JSON))
+    except ConfigError as e:
         raise ConfigError(f"{Path(directory) / BENCH_JSON} has bad prices: {e}") from e
     return BenchConfig(out_dir=Path(directory), **kwargs)
 
@@ -251,7 +267,7 @@ def load_runs(directory: str | Path) -> list[dict[str, Any]]:
 
 
 # Settings that change how a model plays; runs of one spec with different values are separate rows.
-CONFIG_KNOBS = ("notes", "temperature", "history", "reasoning", "max_tokens", "max_turns", "cache", "format")
+CONFIG_KNOBS = ("notes", "temperature", "history", "effort", "max_tokens", "max_turns", "cache", "format")
 
 
 def _counted(run: dict[str, Any], turns: int) -> tuple[bool, str | None]:
@@ -292,11 +308,12 @@ def _flat(run: dict[str, Any]) -> dict[str, Any]:
         "input_tokens": t.get("input_tokens") or 0,
         "output_tokens": t.get("output_tokens") or 0,
         "cost_usd": t.get("cost_usd"),
+        "cost_source": t.get("cost_source"),
         "wall_time_s": t.get("wall_time_s"),
-        "temperature": cfg.get("temperature"),
+        "temperature": cfg.get("temperature"),  # as sent: None for runs that sent none
         "history": cfg.get("history"),
         "notes": bool(cfg.get("notes")),
-        "reasoning": cfg.get("reasoning"),
+        "effort": cfg["effort"] if "effort" in cfg else cfg.get("reasoning"),  # runs before --effort called it reasoning
         "max_tokens": cfg.get("max_tokens"),
         "max_turns": cfg.get("max_turns"),
         # Runs from before these options existed used a sliding window and the text format.
@@ -315,7 +332,7 @@ def _knob_text(name: str, value: Any) -> str:
         return "cache" if value else "no cache"
     short = {"temperature": "t", "history": "h", "max_turns": "turns"}.get(name, name)
     if value is None:
-        value = {"temperature": "none", "reasoning": "default"}.get(name, "?")
+        value = {"temperature": "none", "effort": "default"}.get(name, "?")
     return f"{short}={value}"
 
 
@@ -444,7 +461,7 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
         "ended in a `provider_error` after at least one turn (scored as reached and counted in Errors). Runs "
         "that hit a harness problem (`grue_error`, `interrupted`, `error`) are excluded and listed at the end; "
         "their cost still counts. Rows with the same model spec but different settings (temperature, history, "
-        "notes, reasoning, max tokens, max turns, cache, format) are separate rows, labelled with the differing settings.",
+        "notes, effort, max tokens, max turns, cache, format) are separate rows, labelled with the differing settings.",
         "",
         "Win = game ended `won`. Invalid % = parser rejections per command (server-reported). Format fail % = "
         "replies without a `> COMMAND` line. Errors = valid runs that ended in a provider error.",
@@ -511,8 +528,8 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
 CSV_FIELDS = [
     "run_id", "model", "variant", "game", "status", "stop_reason", "counted", "excluded_reason", "ending",
     "score", "max_score", "max_score_reached", "norm", "turns", "invalid_commands", "parse_failures",
-    "input_tokens", "output_tokens", "cost_usd", "wall_time_s", "temperature", "history", "notes", "reasoning",
-    "max_tokens", "max_turns", "cache", "history_step", "format", "cache_read_tokens", "cache_write_tokens",
+    "input_tokens", "output_tokens", "cost_usd", "cost_source", "wall_time_s", "temperature", "history", "notes",
+    "effort", "max_tokens", "max_turns", "cache", "history_step", "format", "cache_read_tokens", "cache_write_tokens",
 ]
 
 

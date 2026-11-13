@@ -22,5 +22,8 @@ brass-lantern = "brass_lantern.__main__:main"
 [tool.setuptools.packages.find]
 include = ["brass_lantern*"]
 
+[tool.setuptools.package-data]
+brass_lantern = ["prices.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

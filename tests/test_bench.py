@@ -11,6 +11,7 @@ from brass_lantern.bench import (
     write_reports,
 )
 from brass_lantern.grue_client import GrueClient
+from brass_lantern.prices import Price
 from brass_lantern.providers import ConfigError
 from brass_lantern.providers.scripted import ScriptedProvider
 from fake_grue import WIN_SCRIPT
@@ -291,17 +292,18 @@ def test_write_reports_csv_has_variant_and_exclusion_columns(tmp_path):
 def test_run_bench_writes_bench_json_and_it_round_trips(tmp_path, fake, make_grue):
     cfg = BenchConfig(models=["mock:win"], games=["tiny"], runs=1, max_turns=6, notes=True, temperature=None,
                       max_cost_per_run=0.5, max_time_per_run=60.0, grue_url="http://g", out_dir=tmp_path / "b",
-                      prices={"mock:win": (1.0, 2.5)})
+                      prices={"mock:win": Price(1.0, 2.5, 0.1, 3.0)})
     asyncio.run(run_bench(cfg, grue=make_grue(), provider_factory=scripted_factory({"mock:win": WIN_SCRIPT}),
                           log=lambda s: None))
     data = json.loads((cfg.out_dir / "bench.json").read_text(encoding="utf-8"))
     assert data["version"] == 1 and data["created_at"] and data["brass_lantern_version"]
     for key in ("models", "games", "runs", "max_turns", "max_cost_per_run", "max_time_per_run", "history", "notes",
-                "temperature", "max_tokens", "reasoning", "base_url", "grue_url"):
+                "temperature", "max_tokens", "effort", "base_url", "grue_url"):
         assert key in data
-    assert data["models"] == ["mock:win"] and data["temperature"] is None and data["prices"] == {"mock:win": [1.0, 2.5]}
+    assert data["models"] == ["mock:win"] and data["temperature"] is None
+    assert data["prices"] == {"mock:win": {"input": 1.0, "output": 2.5, "cache_read": 0.1, "cache_write": 3.0}}
     assert "out_dir" not in data
-    assert config_from_bench_json(data, cfg.out_dir) == cfg  # tuples and paths come back as they went in
+    assert config_from_bench_json(data, cfg.out_dir) == cfg  # prices and paths come back as they went in
 
 
 def test_bench_json_loader_ignores_unknown_keys_and_defaults_missing_ones(tmp_path):

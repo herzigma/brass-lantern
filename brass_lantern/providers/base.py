@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ class ProviderError(Exception):
 
     partial: "Completion | None" = None
     status: int | None = None  # HTTP status of a non-retryable failure, when there was one
+    body: str | None = None  # full response text of that failure
 
 
 class ConfigError(Exception):
@@ -62,12 +64,20 @@ class Provider(ABC):
     name = "provider"
 
     def __init__(
-        self, model: str, *, temperature: float | None = 0.7, max_tokens: int = 1024, cache: bool = True
+        self,
+        model: str,
+        *,
+        temperature: float | None = 0.7,
+        max_tokens: int = 1024,
+        cache: bool = True,
+        effort: str | None = None,
     ):
         self.model = model
-        self.temperature = temperature
+        self.temperature = temperature  # None = not sent
         self.max_tokens = max_tokens
         self.cache = cache
+        self.effort = effort  # None = not sent (provider default)
+        self.temperature_dropped = False  # True once the API rejected temperature and it was removed
 
     @abstractmethod
     async def complete(
@@ -84,6 +94,7 @@ class Provider(ABC):
             "model": self.model,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
+            "effort": self.effort,
         }
 
 
@@ -106,11 +117,12 @@ class HTTPProvider(Provider):
         temperature: float | None = 0.7,
         max_tokens: int = 1024,
         cache: bool = True,
-        timeout: float = 120.0,
+        effort: str | None = None,
+        timeout: float | httpx.Timeout = 120.0,
         transport: httpx.AsyncBaseTransport | None = None,
         sleep=asyncio.sleep,
     ):
-        super().__init__(model, temperature=temperature, max_tokens=max_tokens, cache=cache)
+        super().__init__(model, temperature=temperature, max_tokens=max_tokens, cache=cache, effort=effort)
         self.base_url = base_url.rstrip("/")
         self._http = httpx.AsyncClient(timeout=timeout, transport=transport)
         self._sleep = sleep
@@ -128,7 +140,28 @@ class HTTPProvider(Provider):
     async def _post_json(
         self, url: str, headers: dict[str, str], payload: dict[str, Any]
     ) -> tuple[dict[str, Any], float]:
-        """POST with retries. Returns (parsed body, latency of the successful attempt)."""
+        """POST with retries. Returns (parsed body, latency of the successful attempt).
+
+        Safety net for models that reject a temperature: if the API answers a non-retryable 400 that
+        mentions ``temperature``, drop it for this provider instance, warn once on stderr and repeat
+        the call once without it.
+        """
+        try:
+            return await self._post_retrying(url, headers, payload)
+        except ProviderError as e:
+            if not (e.status == 400 and _has_temperature(payload) and "temperature" in (e.body or "").lower()):
+                raise
+            self.temperature, self.temperature_dropped = None, True
+            print(
+                f"warning: {self.name}: {self.model} rejected temperature (HTTP 400); "
+                "retrying without it and omitting it from now on.",
+                file=sys.stderr,
+            )
+            return await self._post_retrying(url, headers, _without_temperature(payload))
+
+    async def _post_retrying(
+        self, url: str, headers: dict[str, str], payload: dict[str, Any]
+    ) -> tuple[dict[str, Any], float]:
         for attempt in range(self.max_retries + 1):
             started = time.monotonic()
             retry_after: float | None = None
@@ -158,6 +191,7 @@ class HTTPProvider(Provider):
             if not retryable:
                 err = ProviderError(f"{self.name}: {problem}")
                 err.status = resp.status_code  # (connection errors are always retryable, so resp exists here)
+                err.body = resp.text or ""
                 raise err
             if attempt == self.max_retries:
                 raise ProviderError(f"{self.name}: {problem} (gave up after {attempt + 1} attempts)")
@@ -166,6 +200,19 @@ class HTTPProvider(Provider):
                 delay = max(delay, min(retry_after, 60.0))
             await self._sleep(delay)
         raise AssertionError("unreachable")
+
+
+def _has_temperature(payload: dict[str, Any]) -> bool:
+    config = payload.get("generationConfig")  # Gemini nests it
+    return "temperature" in payload or (isinstance(config, dict) and "temperature" in config)
+
+
+def _without_temperature(payload: dict[str, Any]) -> dict[str, Any]:
+    out = {k: v for k, v in payload.items() if k != "temperature"}
+    config = out.get("generationConfig")
+    if isinstance(config, dict):
+        out["generationConfig"] = {k: v for k, v in config.items() if k != "temperature"}
+    return out
 
 
 def merge_consecutive(messages: list[dict[str, str]]) -> list[dict[str, str]]:
