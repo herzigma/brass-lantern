@@ -116,6 +116,20 @@ def clean_command(raw: str) -> str:
     return s[:MAX_COMMAND_CHARS].rstrip()
 
 
+_ECHOED_FOOTER = re.compile(r"^\s*\[Turn \d+", re.MULTILINE)
+
+
+def strip_hallucinated_turns(text: str) -> str:
+    """Cut a reply where the model starts inventing the next game turn.
+
+    Some models keep writing after their command: a made-up game response, our status
+    footer ("[Turn 21 of 150 | ...]"), then more commands. Everything from the first
+    echoed footer on is not the model's move, so it is ignored when parsing.
+    """
+    m = _ECHOED_FOOTER.search(text)
+    return text[: m.start()] if m else text
+
+
 def parse_command(text: str) -> ParsedCommand:
     """Extract the game command from a model reply.
 
@@ -124,7 +138,7 @@ def parse_command(text: str) -> ParsedCommand:
     commands dropped, and the result truncated to 120 characters.
     """
     prompt_hit = tag_hit = last = None
-    for line in _THINK.sub("", text or "").splitlines():
+    for line in strip_hallucinated_turns(_THINK.sub("", text or "")).splitlines():
         core = _core(line)
         if not core:
             continue

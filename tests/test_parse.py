@@ -114,3 +114,17 @@ def test_compact_reply_last_line_fallback_not_duplicated():
 
 def test_compact_reply_command_only():
     assert compact_reply("> look", "look", parse_command("> look")) == "> look"
+
+
+def test_hallucinated_continuation_is_ignored():
+    reply = (
+        "I'll open it.\n> open tin\nYou open the tin.\n\n"
+        "[Turn 21 of 150 | Score 2 of 10 | Location: Kitchen]\n\n> take everything"
+    )
+    p = parse_command(reply)
+    assert p.command == "open tin" and p.method == "prompt"
+
+
+def test_reply_starting_with_echoed_footer_has_no_command():
+    p = parse_command("[Turn 3 of 50 | Score 0]\n> north")
+    assert p.method == "empty"
