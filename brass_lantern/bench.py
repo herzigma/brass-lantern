@@ -363,10 +363,11 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
             "| Model | Mean score | % of max | Best | Win rate | Mean turns | Invalid % | Cost | Runs | Errors |",
             "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|",
         ]
-        for m in agg["ranking"]:
-            s = models[m]["games"].get(g)
-            if not s:
-                continue
+        played = [m for m in agg["ranking"] if models[m]["games"].get(g)]
+        # Best first within the game; ties keep the overall ranking order (sorted() is stable).
+        played.sort(key=lambda m: -(models[m]["games"][g]["mean_score"] or 0))
+        for m in played:
+            s = models[m]["games"][g]
             lines.append(
                 f"| `{m}` | {_num(s['mean_score'])} | {_pct(s['mean_norm'])} | {s['best_score']} | "
                 f"{_pct(s['win_rate'], 0)} | {_num(s['mean_turns'], 0)} | {_pct(s['invalid_rate'])} | "
