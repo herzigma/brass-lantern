@@ -288,11 +288,15 @@ def _flat(run: dict[str, Any]) -> dict[str, Any]:
     counted, reason = _counted(run, turns)
     if counted and score is None and max_score and max_score > 0:
         score = 0  # finished without ever reporting a score: that is a 0, not a missing value
+    # Peak = the highest score reached (what TALES and TextQuests rank on); the final score can be lower.
+    reached = t.get("max_score_reached")
+    peak = max(score, reached) if score is not None and reached is not None else (score if score is not None else reached)
     return {
         "run_id": run.get("run_id"),
         "model": run["model"],
         "variant": run["model"],  # set by aggregate(): model spec, plus a config suffix when configs differ
         "game": run.get("game"),
+        "game_info": run.get("game_info"),
         "status": run.get("status"),
         "stop_reason": run.get("stop_reason"),
         "counted": counted,
@@ -300,8 +304,9 @@ def _flat(run: dict[str, Any]) -> dict[str, Any]:
         "ending": t.get("ending"),
         "score": score,
         "max_score": max_score,
-        "max_score_reached": t.get("max_score_reached"),
-        "norm": (score / max_score) if score is not None and max_score else None,
+        "max_score_reached": reached,
+        "peak_score": peak,
+        "norm": (peak / max_score) if peak is not None and max_score else None,
         "turns": turns,
         "invalid_commands": t.get("invalid_commands") or 0,
         "parse_failures": t.get("parse_failures") or 0,
@@ -363,7 +368,7 @@ def _mean(values: list[float]) -> float | None:
 
 def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     turns = sum(r["turns"] for r in rows)
-    scores = [r["score"] for r in rows if r["score"] is not None]
+    scores = [r["peak_score"] for r in rows if r["peak_score"] is not None]
     norms = [r["norm"] for r in rows if r["norm"] is not None]
     return {
         "runs": len(rows),
@@ -384,12 +389,34 @@ def _cost(rows: list[dict[str, Any]]) -> float | None:
     return sum(known) if known else None
 
 
-def aggregate(runs: list[dict[str, Any]]) -> dict[str, Any]:
+def _benchmark_game(info: dict[str, Any] | None) -> bool:
+    """An original (or held-out) game that is not a tutorial: the kind a ranking should rest on."""
+    if not isinstance(info, dict):
+        return False
+    tags = info.get("tags") or []
+    return ("original" in tags or bool(info.get("private"))) and info.get("difficulty") != "tutorial"
+
+
+def ranked_games_for(flat: list[dict[str, Any]], rank_games: list[str] | None = None) -> list[str]:
+    """Which games the overall score averages over.
+
+    ``rank_games`` wins when given. Otherwise: the original, non-tutorial games in the bench (classics are
+    memorized and tutorials are won by everyone, so neither separates models); if the bench has none of those,
+    every game with a known max score, as before.
+    """
+    games = sorted({r["game"] for r in flat})
+    scored = [g for g in games if any(r["game"] == g and r["max_score"] for r in flat)]
+    if rank_games:
+        return [g for g in scored if g in rank_games]
+    originals = [g for g in scored if any(r["game"] == g and _benchmark_game(r.get("game_info")) for r in flat)]
+    return originals or scored
+
+
+def aggregate(runs: list[dict[str, Any]], rank_games: list[str] | None = None) -> dict[str, Any]:
     flat = [_flat(r) for r in runs]
     games = sorted({r["game"] for r in flat})
     variants = _variants(flat)
-    # Games with a known max score are the ones that can be normalized and ranked on.
-    ranked_games = [g for g in games if any(r["game"] == g and r["max_score"] for r in flat)]
+    ranked_games = ranked_games_for(flat, rank_games)
     models: dict[str, Any] = {}
     for label, info in variants.items():
         mine = [r for r in flat if r["variant"] == label]
@@ -451,11 +478,14 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
         "",
         f"{agg['n_runs']} runs, {len(models)} models, {len(games)} games. Generated {agg['generated_at']}.",
         "",
-        "**Score formula.** A run's score is its final in-game score divided by the game's maximum "
-        "(a finished run that never reported a score counts as 0; games without a maximum are left out of "
-        "the ranking). A model's per-game score is the mean over its valid runs in that game. Its overall "
-        "score is the mean over ALL games in the bench that have a maximum score: a game where the model has "
-        "no valid run counts as 0 and is marked `*`, so failing on hard games cannot raise its rank.",
+        "**Score formula.** A run's score is its peak in-game score (the highest it reached) divided by the "
+        "game's maximum (a finished run that never reported a score counts as 0). A model's per-game score is the "
+        "mean over its valid runs in that game. Its overall score is the mean over the RANKED games: a ranked game "
+        "where the model has no valid run counts as 0 and is marked `*`, so failing on hard games cannot raise its rank.",
+        "",
+        f"**Ranked games:** {', '.join(f'`{g}`' for g in agg['ranked_games']) or 'none'}. By default these are the "
+        "original, non-tutorial games (classics are memorized and tutorials are won by everyone); `--rank-games` "
+        "overrides. Other games are shown below but do not count.",
         "",
         "**Valid runs.** Completed runs, including those stopped by turn, time or cost limits, plus runs that "
         "ended in a `provider_error` after at least one turn (scored as reached and counted in Errors). Runs "
@@ -484,7 +514,8 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
     if any_missing:
         lines += ["", "\\* counts at least one game with no valid run as 0 (see the `- (=0)` cells below)."]
     if games:
-        lines += ["", "## Mean score by game", "", "| Model | " + " | ".join(games) + " |", "|---|" + "--:|" * len(games)]
+        heads = [g if g in agg["ranked_games"] else f"{g} (unranked)" for g in games]
+        lines += ["", "## Mean peak score by game", "", "| Model | " + " | ".join(heads) + " |", "|---|" + "--:|" * len(games)]
         for m in agg["ranking"]:
             cells = []
             for g in games:
@@ -502,7 +533,7 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
             "",
             f"## {g}" + (f" (max score {max_score})" if max_score else ""),
             "",
-            "| Model | Mean score | % of max | Best | Win rate | Mean turns | Invalid % | Cost | Runs | Errors |",
+            "| Model | Mean peak | % of max | Best | Win rate | Mean turns | Invalid % | Cost | Runs | Errors |",
             "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|",
         ]
         played = [m for m in agg["ranking"] if models[m]["games"].get(g)]
@@ -527,17 +558,17 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
 
 CSV_FIELDS = [
     "run_id", "model", "variant", "game", "status", "stop_reason", "counted", "excluded_reason", "ending",
-    "score", "max_score", "max_score_reached", "norm", "turns", "invalid_commands", "parse_failures",
+    "score", "max_score", "max_score_reached", "peak_score", "norm", "turns", "invalid_commands", "parse_failures",
     "input_tokens", "output_tokens", "cost_usd", "cost_source", "wall_time_s", "temperature", "history", "notes",
     "effort", "max_tokens", "max_turns", "cache", "history_step", "format", "cache_read_tokens", "cache_write_tokens",
 ]
 
 
-def write_reports(directory: str | Path, runs: list[dict[str, Any]]) -> dict[str, Any]:
+def write_reports(directory: str | Path, runs: list[dict[str, Any]], rank_games: list[str] | None = None) -> dict[str, Any]:
     """Write leaderboard.md, results.csv and summary.json into *directory*."""
     d = Path(directory)
     d.mkdir(parents=True, exist_ok=True)
-    agg = aggregate(runs)
+    agg = aggregate(runs, rank_games)
     (d / "leaderboard.md").write_text(render_leaderboard(agg), encoding="utf-8")
     with (d / "results.csv").open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")

@@ -236,13 +236,17 @@ A bench also writes `bench.json` (its settings, with `"version": 1`, used by `--
 
 ## How scoring works
 
-- **Score** = the final in-game score Grue reports. **Normalized score** = score / max score. A finished run that never
-  reported a score but whose game has a max score counts as 0. Games without a max score are left out of normalized
-  rankings.
-- **Overall ranking** = the mean, over **all** games in the bench that have a max score, of the model's per-game mean
-  normalized score (each game weighs the same regardless of repeat counts). A game where the model has no valid run
-  counts as 0 and is marked `*` (and `- (=0)` in the per-game matrix), so a model cannot rank higher by failing on hard
-  games. The formula is repeated at the top of `leaderboard.md`.
+- **Score** = the run's peak in-game score: the highest score Grue saw it reach (`max_score_reached`), which is what
+  TALES and TextQuests rank on. The final score is kept as `score` in `results.csv`. **Normalized score** = peak / max
+  score. A finished run that never reported a score but whose game has a max score counts as 0.
+- **Ranked games** = the original, non-tutorial games in the bench (from the game's catalog tags, recorded in each
+  run.json as `game_info`). Classics are left out because models have memorized them, and tutorials because every
+  model wins them; both still get their own tables. A bench with no original games ranks every game that has a max
+  score. `--rank-games id,id` (on `bench` or `report`) sets the list explicitly.
+- **Overall ranking** = the mean, over the ranked games, of the model's per-game mean normalized score (each game
+  weighs the same regardless of repeat counts). A ranked game where the model has no valid run counts as 0 and is
+  marked `*` (and `- (=0)` in the per-game matrix), so a model cannot rank higher by failing on hard games. The
+  formula is repeated at the top of `leaderboard.md`.
 - **Valid runs** are those that count in the scores:
   - completed runs, including ones stopped by `--max-turns`, `--max-cost`, `--max-time` or `max_calls`;
   - runs that ended in `provider_error` after at least one turn: the model or provider failing is a real outcome, so they

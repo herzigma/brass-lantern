@@ -96,6 +96,10 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                         "(brass_lantern/prices.json), so --max-cost works for providers that report no cost")
 
 
+RANK_GAMES_HELP = ("comma-separated game ids the overall score averages over (default: the original, "
+                   "non-tutorial games in the bench, or every scored game if there are none)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="brass-lantern",
@@ -137,10 +141,12 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--max-cost-per-run", type=float, help="per-episode dollar cap")
     b.add_argument("--max-time-per-run", type=float, help="per-episode time cap in seconds")
     b.add_argument("--out", help="output directory (default: runs/bench-<timestamp>)")
+    b.add_argument("--rank-games", type=_csv, metavar="IDS", help=RANK_GAMES_HELP)
     _add_common(b)
 
     r = sub.add_parser("report", help="regenerate leaderboard.md / results.csv / summary.json from run.json files")
     r.add_argument("dir", help="directory containing run.json files (searched recursively)")
+    r.add_argument("--rank-games", type=_csv, metavar="IDS", help=RANK_GAMES_HELP)
     return parser
 
 
@@ -198,9 +204,9 @@ def _shell_path(path: Path) -> str:
     return f'"{text}"' if " " in text else text
 
 
-def _finish_bench(out: Path, interrupted: bool) -> int:
+def _finish_bench(out: Path, interrupted: bool, rank_games: list[str] | None = None) -> int:
     """Write the reports over every run in *out* and print the leaderboard."""
-    agg = write_reports(out, load_runs(out))
+    agg = write_reports(out, load_runs(out), rank_games)
     print()
     print(render_leaderboard(agg))
     print(f"wrote {out / 'leaderboard.md'}, results.csv, summary.json")
@@ -245,7 +251,7 @@ async def _bench_resume(args: argparse.Namespace) -> int:
     if jobs:
         async with GrueClient(cfg.grue_url) as grue:
             _, interrupted = await run_bench(cfg, grue=grue, jobs=jobs)
-    return _finish_bench(out, interrupted)
+    return _finish_bench(out, interrupted, getattr(args, "rank_games", None))
 
 
 async def _bench(args: argparse.Namespace) -> int:
@@ -269,7 +275,7 @@ async def _bench(args: argparse.Namespace) -> int:
         print(f"bench: {len(cfg.models)} models x {len(cfg.games)} games x {cfg.runs} runs = {total} episodes "
               f"(concurrency {cfg.concurrency}) -> {out}")
         _, interrupted = await run_bench(cfg, grue=grue)
-    return _finish_bench(out, interrupted)
+    return _finish_bench(out, interrupted, getattr(args, "rank_games", None))
 
 
 def _report(args: argparse.Namespace) -> int:
@@ -277,14 +283,14 @@ def _report(args: argparse.Namespace) -> int:
     if not runs:
         print(f"error: no run.json files found under {args.dir}", file=sys.stderr)
         return 1
-    agg = write_reports(args.dir, runs)
+    agg = write_reports(args.dir, runs, args.rank_games)
     print(render_leaderboard(agg))
     print(f"wrote leaderboard.md, results.csv, summary.json in {args.dir}")
     return 0
 
 
 # bench options that may still be given with --resume; everything else comes from DIR/bench.json
-RESUME_OVERRIDES = {"command", "resume", "runs", "concurrency", "max_cost_per_run", "max_time_per_run", "grue_url", "prices"}
+RESUME_OVERRIDES = {"command", "resume", "runs", "concurrency", "max_cost_per_run", "max_time_per_run", "grue_url", "prices", "rank_games"}
 
 
 def _check_bench_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -295,8 +301,8 @@ def _check_bench_args(parser: argparse.ArgumentParser, args: argparse.Namespace)
         if clash:
             parser.error("--resume takes its settings from DIR/bench.json, so it cannot be combined with "
                          + ", ".join("--" + k.replace("_", "-") for k in clash)
-                         + ". Only --runs, --concurrency, --max-cost-per-run, --max-time-per-run, --grue-url "
-                         "and --prices can be changed on resume.")
+                         + ". Only --runs, --concurrency, --max-cost-per-run, --max-time-per-run, --grue-url, "
+                         "--prices and --rank-games can be changed on resume.")
         return
     missing = [f"--{k}" for k in ("models", "games") if not getattr(args, k)]
     if missing:

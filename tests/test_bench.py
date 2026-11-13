@@ -80,7 +80,7 @@ def test_aggregate_handles_games_without_max_score_and_empty():
 def test_leaderboard_markdown():
     md = render_leaderboard(aggregate(RUNS))
     assert md.startswith("# Brass Lantern Leaderboard")
-    assert "## Overall ranking" in md and "## Mean score by game" in md and "## zork (max score 350)" in md
+    assert "## Overall ranking" in md and "## Mean peak score by game" in md and "## zork (max score 350)" in md
     rows = [ln for ln in md.splitlines() if ln.startswith("| ") and "`" in ln]
     overall = rows[:3]
     assert overall[0].startswith("| 1 | `A`") and overall[1].startswith("| 2 | `C`") and overall[2].startswith("| 3 | `B`")
@@ -90,7 +90,7 @@ def test_leaderboard_markdown():
     assert "2 (0)" not in md and "2 (1)" in overall[2]  # B: 2 counted runs, 1 excluded
     assert "n/a" in overall[1]  # C has no cost
     assert "## Excluded runs" in md and "B-zork-340-turn_limit-error" in md
-    assert "mean over ALL games" in md  # the formula is documented at the top
+    assert "mean over the RANKED games" in md and "peak in-game score" in md  # the formula is documented at the top
     assert md.index("Score formula") < md.index("## Overall ranking")
 
 
@@ -478,3 +478,44 @@ def test_resume_help_and_interrupted_message_show_the_command(tmp_path, capsys):
     assert cli._finish_bench(d, interrupted=True) == 130
     assert f'brass-lantern bench --resume "{d}"' in capsys.readouterr().err
     assert cli._finish_bench(d, interrupted=False) == 0 and "--resume" not in capsys.readouterr().err
+
+
+def test_peak_score_is_ranked_not_final_score():
+    r = make_run("A", "g", 20, 50)
+    r["totals"]["max_score_reached"] = 30  # the run lost 10 points before it ended
+    row = aggregate([r])["rows"][0]
+    assert row["score"] == 20 and row["peak_score"] == 30
+    assert row["norm"] == 30 / 50
+    # runs from servers that never reported a peak fall back to the final score
+    old = make_run("A", "g", 20, 50)
+    old["totals"]["max_score_reached"] = None
+    assert aggregate([old])["rows"][0]["norm"] == 20 / 50
+
+
+def _info(run, tags, difficulty="medium"):
+    run["game_info"] = {"tags": tags, "difficulty": difficulty, "private": "private" in tags}
+    return run
+
+
+def test_only_original_non_tutorial_games_are_ranked():
+    runs = [
+        _info(make_run("A", "held", 40, 50), ["original", "private"]),
+        _info(make_run("A", "tutorial", 10, 10, ending="won"), ["original"], "tutorial"),
+        _info(make_run("A", "zork", 35, 350), ["classic"], "hard"),
+        _info(make_run("B", "held", 10, 50), ["original", "private"]),
+        _info(make_run("B", "tutorial", 10, 10, ending="won"), ["original"], "tutorial"),
+        _info(make_run("B", "zork", 350, 350, ending="won"), ["classic"], "hard"),
+    ]
+    agg = aggregate(runs)
+    assert agg["ranked_games"] == ["held"]
+    assert agg["ranking"] == ["A", "B"], "B's memorized Zork win does not count"
+    assert abs(agg["models"]["A"]["overall"]["norm_score"] - 0.8) < 1e-9
+    md = render_leaderboard(agg)
+    assert "**Ranked games:** `held`" in md and "zork (unranked)" in md
+    # an explicit list wins
+    assert aggregate(runs, ["zork"])["ranking"] == ["B", "A"]
+
+
+def test_bench_without_original_games_ranks_every_scored_game():
+    agg = aggregate(RUNS)  # no game_info at all (older runs, or classics only)
+    assert agg["ranked_games"] == ["tiny", "zork"]

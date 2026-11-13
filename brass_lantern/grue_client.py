@@ -54,6 +54,7 @@ class Game:
     tags: list[str] = field(default_factory=list)
     description: str | None = None
     license: str | None = None
+    private: bool = False  # held-out game: scores public, transcripts never served
     available: bool = True
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 

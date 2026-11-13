@@ -183,6 +183,7 @@ async def play_episode(
     error: str | None = None
     agent: Agent | None = None
     report_state: dict[str, Any] | None = None  # set once the client report was attempted
+    game_info: dict[str, Any] | None = None  # the game's catalog tags/difficulty, used to decide what is ranked
 
     def build_summary(final: bool) -> dict[str, Any]:
         score = result.score if result and result.score is not None else (obs.score if obs else None)
@@ -197,6 +198,7 @@ async def play_episode(
             "error": error,
             "model": cfg.model,
             "game": cfg.game,
+            "game_info": game_info,
             "session_id": session_id,
             "started_at": started_at,
             "ended_at": now_iso() if final else None,
@@ -288,6 +290,12 @@ async def play_episode(
         try:
             obs = await grue.start_session(cfg.game, cfg.max_turns, meta)
             session_id = obs.session_id
+            try:
+                g = next((g for g in await grue.list_games() if g.id == cfg.game), None)
+                if g is not None:
+                    game_info = {"tags": list(g.tags), "difficulty": g.difficulty, "private": bool(g.raw.get("private"))}
+            except GrueError:
+                pass  # only used to decide which games a leaderboard ranks
             max_turns = cfg.max_turns
             if max_turns is None:  # learn the limit the server applied (the game's suggested one)
                 try:
