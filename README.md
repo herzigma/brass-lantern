@@ -236,7 +236,7 @@ Each episode writes `runs/<run_id>/` (run ids look like `20261112-210000-zork1-o
   `max_calls`, `provider_error`, `grue_error`, `interrupted`, `error`), Grue's final `Result`, and totals: turns, score, max score,
   ending, input/output tokens, cache read/write tokens and hit rate, cost and `cost_source` (`provider`, `prices` or
   `null`), wall time, parse failures, invalid commands, and `memorization` (the
-  [probe](#how-scoring-works): `status`, recalled `commands`, the blind replay's `peak_score` and `ending`, its
+  [probe](#how-scoring-works): `status`, the model's `answer` (first 4000 characters), recalled `commands`, the blind replay's `peak_score` and `ending`, its
   `session_id`, tokens and `cost_usd`).
 - `transcript.jsonl`: one line per turn with the observation the model saw, the raw model reply, the command sent,
   parse method, tokens (including cache reads and writes), any tool calls, cost, latency and finish reason; plus a final

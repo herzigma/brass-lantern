@@ -58,6 +58,7 @@ def test_a_recalled_walkthrough_that_wins_blind_is_positive(fake, make_grue):
     out = probe(fake, make_grue, p, title="Tiny Cave", author="Ann Author")
     assert out["status"] == "positive" and out["ending"] == "won" and out["peak_score"] == 10
     assert out["commands"] == ["take lamp", "north", "open chest", "take gem"] and out["cost_usd"] == 0.01
+    assert out["answer"] == WALKTHROUGH, "the model's answer is kept so the verdict can be checked"
     prompt, max_tokens = p.calls[0]
     assert "Tiny Cave by Ann Author" in prompt and "You are standing in a field" in prompt
     assert max_tokens == PROBE_MAX_TOKENS and p.max_tokens == 1024, "the cap is raised for the probe only"

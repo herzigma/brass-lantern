@@ -26,6 +26,7 @@ from brass_lantern.providers import Completion, Provider, ProviderError
 PROBE_THRESHOLD = 0.05
 PROBE_MAX_COMMANDS = 1000  # commands replayed at most
 PROBE_MAX_TOKENS = 8192  # a walkthrough is long; the run's own cap (often 1024) would cut it off
+PROBE_ANSWER_CHARS = 4000  # how much of the model's answer the probe record keeps
 OFFLINE_PROVIDERS = ("mock", "human")  # replay or type commands: there is nothing to probe
 
 PROBE_SYSTEM = (
@@ -122,6 +123,7 @@ async def run_probe(
         commands = parse_commands(comp.text)
         out["unknown"] = comp.text.strip().upper().startswith("UNKNOWN")
         out["commands"] = commands
+        out["answer"] = comp.text[:PROBE_ANSWER_CHARS]  # what the model wrote, so a verdict can be checked
         for cmd in commands:
             if obs.game_over:
                 break
