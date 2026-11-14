@@ -31,7 +31,7 @@ brass-lantern play --game zork1 --model mock:script.txt --max-turns 20
 # a real model through OpenRouter
 brass-lantern play --game zork1 --model openrouter:anthropic/claude-haiku-4.5 --max-turns 150 --max-cost 0.25
 
-# any Z-code, Glulx or Blorb story file from the IF Archive or GitHub (unranked; --sha256 is optional)
+# any Z-code, Glulx or Blorb story file from the IF Archive or GitHub (--sha256, --max-score and --par are optional)
 brass-lantern play --game-url https://www.ifarchive.org/if-archive/games/zcode/LostPig.z8 --model mock:script.txt
 ```
 
@@ -120,7 +120,7 @@ what each model accepts:
 
 ```bash
 brass-lantern games
-brass-lantern play  --game zork1 | --game-url URL [--sha256 HEX]  --model SPEC [--max-turns 150] [--max-cost 0.5] [--max-time 900]
+brass-lantern play  --game zork1 | --game-url URL [--sha256 HEX] [--max-score N] [--par N]  --model SPEC [--max-turns 150] [--max-cost 0.5] [--max-time 900]
                     [--history 30] [--notes] [--cache on|off] [--format text|tools]
                     [--temperature 0.7|none] [--effort low|...|max] [--max-tokens N] [--prices FILE]
                     [--base-url URL] [--out runs] [--quiet] [--seed-meta KEY=VALUE]
@@ -131,8 +131,12 @@ brass-lantern report runs/bench-demo
 # --max-turns defaults to the game's suggested limit from the Grue catalog (e.g. 300 for skerrin-light)
 ```
 
-- `--game-url` plays a story file the server has not installed (Grue PROTOCOL.md section 11). The run is unranked:
-  Grue leaves it out of its results and export unless asked (`include_unranked=1`), and `report` never ranks it.
+- `--game-url` plays a story file the server has not installed (Grue PROTOCOL.md section 11). Grue leaves the run out
+  of its results and export unless asked (`include_unranked=1`). Many games show no maximum on their status line, so
+  Grue cannot learn the max score and `report` cannot rank the run. Give it with `--max-score N` (the game's SCORE
+  command usually says it), and the walkthrough length with `--par N` for the efficiency score. Both are recorded in
+  run.json's `game_info`, and the probe uses the max score too. Comp games come zipped: use the IF Archive's unbox
+  link to the story file inside, e.g. `https://unbox.ifarchive.org/0pjaj4ofv3/BTB_260909.z5`.
 - `--games all` benchmarks every available game on the server.
 - `--seed-meta KEY=VALUE` (repeatable) adds fields to the metadata Grue stores with the session.
 - `--temperature` defaults to 0.7. Pass `none` to omit it. It is left out automatically where a model is known to reject

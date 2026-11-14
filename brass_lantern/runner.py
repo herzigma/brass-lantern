@@ -54,6 +54,10 @@ class RunConfig:
     meta: dict[str, Any] = field(default_factory=dict)  # extra session meta
     game_url: str | None = None  # play this story file URL (unranked) instead of the catalog game; `game` is then a label
     sha256: str | None = None  # expected SHA-256 of the file at game_url
+    # A URL game has no catalog entry: its max score (used when Grue cannot read one from the status line, and needed
+    # to rank the run) and par (commands in a known winning walkthrough, for efficiency) can be given here.
+    max_score: int | None = None
+    par: int | None = None
     memorization_probe: bool = True  # probe whether the model knows the game's solution before playing it
     probe_result: dict[str, Any] | None = None  # a probe already run for this model and game (a bench shares one)
     # USD per 1M tokens, for providers that report no cost: a Price, or just (input, output)
@@ -151,7 +155,7 @@ async def probe_for(cfg: RunConfig, *, grue: GrueClient, provider: Provider, gam
     return await run_probe(
         grue=grue, provider=provider, game=cfg.game, model=cfg.model,
         title=game.title if game else None, author=game.author if game else None,
-        game_url=cfg.game_url, sha256=cfg.sha256, price=as_price(cfg.price),
+        game_url=cfg.game_url, sha256=cfg.sha256, max_score=cfg.max_score, price=as_price(cfg.price),
     )
 
 
@@ -205,7 +209,7 @@ async def play_episode(
     def build_summary(final: bool) -> dict[str, Any]:
         score = result.score if result and result.score is not None else (obs.score if obs else None)
         max_score = (
-            (result.max_score if result else None) or (obs.max_score if obs else None)
+            (result.max_score if result else None) or (obs.max_score if obs else None) or cfg.max_score
         )
         return {
             "run_id": run_id,
@@ -311,6 +315,9 @@ async def play_episode(
             try:
                 # A URL game has no catalog entry: never borrow a catalog game's tags because the labels match.
                 g = None if cfg.game_url else next((g for g in await grue.list_games() if g.id == cfg.game), None)
+                if cfg.game_url and (cfg.max_score or cfg.par):
+                    game_info = {"tags": [], "difficulty": None, "private": False, "par": cfg.par,
+                                 "max_score": cfg.max_score, "source": "game_url"}
                 if g is not None:
                     game_info = {"tags": list(g.tags), "difficulty": g.difficulty, "private": bool(g.raw.get("private")),
                                  "par": g.par}

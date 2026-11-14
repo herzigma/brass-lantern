@@ -20,6 +20,11 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+
+def _max_score(s: dict) -> int | None:
+    """Like real Grue, a URL game whose status line shows no maximum has no max score."""
+    return None if s["game"].startswith("url-") else 10
+
 class FakeGrue:
     def __init__(self, api_key: str | None = None, session_cap: int | None = None):
         self.api_key = api_key
@@ -150,7 +155,7 @@ class FakeGrue:
     def _summary(self, s: dict) -> dict:
         return {
             "session_id": s["id"], "game_id": s["game"], "started_at": s["started_at"], "turn": s["turn"],
-            "max_turns": s["max_turns"], "score": s["score"], "max_score": 10, "game_over": s["game_over"],
+            "max_turns": s["max_turns"], "score": s["score"], "max_score": _max_score(s), "game_over": s["game_over"],
             "ending": s["ending"], "meta": s["meta"],
         }
 
@@ -158,7 +163,7 @@ class FakeGrue:
         return {
             "session_id": s["id"], "game_id": s["game"], "turn": s["turn"], "text": text,
             "status_line": f"{s['room']}   Score: {s['score']}", "location": s["room"], "score": s["score"],
-            "max_score": 10, "moves": s["turn"], "input_type": None if s["game_over"] else "line",
+            "max_score": _max_score(s), "moves": s["turn"], "input_type": None if s["game_over"] else "line",
             "game_over": s["game_over"], "ending": s["ending"], "notice": None,
         }
 

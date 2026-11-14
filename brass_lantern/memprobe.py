@@ -91,9 +91,13 @@ async def run_probe(
     author: str | None = None,
     game_url: str | None = None,
     sha256: str | None = None,
+    max_score: int | None = None,
     price: Price | None = None,
 ) -> dict[str, Any]:
-    """Probe one model on one game. Never raises for model or server problems: they give status "error"."""
+    """Probe one model on one game. Never raises for model or server problems: they give status "error".
+
+    ``max_score`` is used when Grue reports none (a URL game whose status line shows no maximum).
+    """
     if provider.name in OFFLINE_PROVIDERS:
         return skipped(f"{provider.name} provider")
     t0 = time.monotonic()
@@ -132,9 +136,10 @@ async def run_probe(
         peak = result.max_score_reached if result.max_score_reached is not None else result.score
         if peak is not None and result.score is not None:
             peak = max(peak, result.score)
+        top = result.max_score or max_score
         out.update(
-            peak_score=peak, max_score=result.max_score, ending=result.ending, replayed=result.turn,
-            status=verdict(peak, result.max_score, result.ending),
+            peak_score=peak, max_score=top, ending=result.ending, replayed=result.turn,
+            status=verdict(peak, top, result.ending),
         )
     except ProviderError as e:
         out["error"] = str(e)[:300]

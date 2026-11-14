@@ -4,6 +4,7 @@ import pytest
 
 import brass_lantern.__main__ as cli
 from brass_lantern import __version__
+from brass_lantern.bench import aggregate
 from brass_lantern.grue_client import GrueClient
 from brass_lantern.prices import Price
 from fake_grue import WIN_SCRIPT
@@ -62,6 +63,30 @@ def test_play_command_with_game_url(patched_grue, tmp_path):
     run = json.loads((tmp_path / "runs" / "u1" / "run.json").read_text(encoding="utf-8"))
     assert run["game"] == "zork1" and run["game_url"] == url
     assert run["game_info"] is None, "a URL game never borrows the catalog zork1's tags"
+    assert run["totals"]["max_score"] is None, "Grue read no max score, and none was given"
+
+
+def test_play_url_game_with_max_score_and_par_is_rankable(patched_grue, tmp_path):
+    script = tmp_path / "win.txt"
+    script.write_text("\n".join(WIN_SCRIPT), encoding="utf-8")
+    url = "https://www.ifarchive.org/if-archive/games/zcode/Bob.z5"
+    runs = tmp_path / "runs"
+    code = cli.main(["play", "--game-url", url, "--max-score", "10", "--par", "4", "--model", f"mock:{script}",
+                     "--out", str(runs), "--run-id", "u2", "--quiet"])
+    assert code == 0
+    run = json.loads((runs / "u2" / "run.json").read_text(encoding="utf-8"))
+    assert run["totals"]["max_score"] == 10
+    assert run["game_info"] == {"tags": [], "difficulty": None, "private": False, "par": 4, "max_score": 10,
+                                "source": "game_url"}
+    agg = aggregate([run], rank_unprobed=True)  # the mock provider skips the probe
+    assert agg["ranked_games"] == ["Bob"] and agg["par"]["Bob"] == {"par": 4, "source": "walkthrough"}
+
+
+def test_max_score_and_par_need_a_game_url(patched_grue, tmp_path, capsys):
+    assert cli.main(["play", "--game", "tiny", "--max-score", "10", "--model", "mock:x.txt"]) == 2
+    assert "--game-url" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        cli.main(["play", "--game-url", "https://ifarchive.org/x.z5", "--par", "0", "--model", "mock:x.txt"])
 
 
 def test_play_needs_exactly_one_game(patched_grue, tmp_path):

@@ -136,3 +136,13 @@ def test_bench_probes_each_model_and_game_once(fake, make_grue, tmp_path):
     for s in summaries:
         by_model.setdefault(s["model"], set()).add(s["memorization"]["session_id"])
     assert all(len(ids) == 1 for ids in by_model.values()), "repeats share their model's probe"
+
+
+def test_a_url_game_probe_uses_the_given_max_score(fake, make_grue):
+    # Grue reports no max score for this URL game, so a partial recall (5 of 10 points) needs the given one to count.
+    url = "https://www.ifarchive.org/if-archive/games/zcode/tiny.z5"
+    partial = "take lamp\nnorth\nopen chest"
+    out = probe(fake, make_grue, Recall(partial), game_url=url)
+    assert out["max_score"] is None and out["peak_score"] == 5 and out["status"] == "negative"
+    out = probe(fake, make_grue, Recall(partial), game_url=url, max_score=10)
+    assert out["max_score"] == 10 and out["status"] == "positive"

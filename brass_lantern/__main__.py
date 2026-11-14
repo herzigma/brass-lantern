@@ -61,6 +61,16 @@ def _url_label(url: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-")[:40] or "url"
 
 
+def _positive_int(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        n = 0
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive whole number, not {value!r}")
+    return n
+
+
 def _kv(value: str) -> tuple[str, str]:
     key, sep, val = value.partition("=")
     if not sep or not key:
@@ -133,8 +143,15 @@ def build_parser() -> argparse.ArgumentParser:
     which.add_argument("--game", help="game id (see `brass-lantern games`)")
     which.add_argument("--game-url", metavar="URL",
                        help="play a story file from this https URL instead (Z-code, Glulx or Blorb on a host the server "
-                            "allows, e.g. ifarchive.org); the run is unranked")
+                            "allows, e.g. ifarchive.org); Grue leaves it out of its results, and `report` ranks it "
+                            "only when --max-score is given")
     p.add_argument("--sha256", help="with --game-url: the file's expected SHA-256, to pin the exact release")
+    p.add_argument("--max-score", type=_positive_int, metavar="N",
+                   help="with --game-url: the game's maximum score, used when Grue cannot read one from the status "
+                        "line; a run is ranked only when its game has a max score")
+    p.add_argument("--par", type=_positive_int, metavar="N",
+                   help="with --game-url: commands in a known winning walkthrough, for the efficiency score "
+                        "(default: the fewest turns any run in the report won in)")
     p.add_argument("--model", required=True, help="provider:model spec (see below)")
     p.add_argument("--max-cost", type=float, help="stop when spent dollars reach this (needs cost data; see --prices)")
     p.add_argument("--max-time", type=float, help="stop after this many seconds")
@@ -187,6 +204,9 @@ async def _games(args: argparse.Namespace) -> int:
 
 
 async def _play(args: argparse.Namespace) -> int:
+    if (args.max_score or args.par) and not args.game_url:
+        print("error: --max-score and --par are for --game-url games; a catalog game has its own", file=sys.stderr)
+        return 2
     prices = load_prices(args.prices)
     provider = create_provider(args.model, base_url=args.base_url, temperature=args.temperature, max_tokens=args.max_tokens,
                                effort=args.effort, cache=args.cache == "on")
@@ -198,7 +218,7 @@ async def _play(args: argparse.Namespace) -> int:
         temperature=sent.temperature, max_tokens=sent.max_tokens, effort=sent.effort,
         base_url=args.base_url, grue_url=args.grue_url, out_dir=Path(args.out), run_id=args.run_id,
         quiet=args.quiet, meta=dict(args.seed_meta), price=price_for(prices, args.model),
-        memorization_probe=args.memorization_probe,
+        memorization_probe=args.memorization_probe, max_score=args.max_score, par=args.par,
     )
     if cfg.max_cost is not None and provider.name not in ("openrouter", "mock", "human") and not cfg.price:
         print(f"warning: {args.model} reports no dollar cost, so --max-cost will not stop the run "
