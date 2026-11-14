@@ -222,20 +222,21 @@ def test_provider_error_runs_count_if_played_and_are_flagged_harness_errors_are_
         make_run("A", "g", 9, 10, status="error", stop_reason="grue_error", run_id="grue"),
         make_run("A", "g", 9, 10, status="interrupted", stop_reason="interrupted", run_id="intr"),
         make_run("A", "g", 9, 10, status="error", stop_reason="error", run_id="boom"),
+        make_run("A", "g", 0, 10, ending="crashed", turns=6, run_id="crash"),  # the interpreter died
         make_run("A", "g", 4, 10, run_id="ok"),
     ]
     agg = aggregate(runs)
     o, g = agg["models"]["A"]["overall"], agg["models"]["A"]["games"]["g"]
-    assert o["runs"] == 2 and o["excluded_runs"] == 4 and o["provider_errors"] == 1 and g["provider_errors"] == 1
+    assert o["runs"] == 2 and o["excluded_runs"] == 5 and o["provider_errors"] == 1 and g["provider_errors"] == 1
     assert g["mean_score"] == 5  # (6 + 4) / 2: the provider-error run counts at the score it reached
     reasons = {e["run_id"]: e["reason"] for e in agg["excluded"]}
     assert reasons == {"pe-none": "provider_error (no turns played)", "grue": "grue_error",
-                       "intr": "interrupted", "boom": "error"}
+                       "intr": "interrupted", "boom": "error", "crash": "game crashed"}
     md = render_leaderboard(agg)
     assert "| Errors |" in md and "## Excluded runs" in md
     assert "| grue |" in md and "grue_error" in md and "pe-played" not in md
     overall_row = next(ln for ln in md.splitlines() if ln.startswith("| 1 |"))
-    assert overall_row.endswith("| 2 (6, 4) | 1 |")
+    assert overall_row.endswith("| 2 (7, 5) | 1 |")
     # no exclusions -> no section
     assert "## Excluded runs" not in render_leaderboard(aggregate([make_run("A", "g", 1, 10)]))
 

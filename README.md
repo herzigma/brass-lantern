@@ -276,8 +276,8 @@ A bench also writes `bench.json` (its settings, with `"version": 1`, used by `--
   - runs that ended in `provider_error` after at least one turn: the model or provider failing is a real outcome, so they
     are scored as reached and flagged in the **Errors** column (per model and per game; also `provider_errors` in
     `summary.json`).
-- **Excluded runs** hit a harness problem (`grue_error`, `interrupted`, `error`, still `running`, or a `provider_error`
-  before the first turn). They are left out of scores, counted in the "excl." column and listed with their reason in the
+- **Excluded runs** hit a harness problem (`grue_error`, `interrupted`, `error`, still `running`, a `provider_error`
+  before the first turn, or a game that ended `crashed` because its interpreter died). They are left out of scores, counted in the "excl." column and listed with their reason in the
   "Excluded runs" section of `leaderboard.md` (and `excluded_reason` in `results.csv`). Their cost still counts.
 - **Configurations:** runs are grouped by model spec (including any `@effort`) **and** the settings that change behaviour
   (temperature as sent, history, notes, effort, max tokens, max turns, cache, format). If one spec was run with different settings, each configuration is its own

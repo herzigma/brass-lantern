@@ -303,6 +303,8 @@ CONFIG_KNOBS = ("notes", "temperature", "history", "effort", "max_tokens", "max_
 def _counted(run: dict[str, Any], turns: int) -> tuple[bool, str | None]:
     """Does this run count towards scores? Returns (counted, reason it was excluded)."""
     status, stop = run.get("status"), run.get("stop_reason")
+    if (run.get("totals") or {}).get("ending") == "crashed":
+        return False, "game crashed"  # the interpreter died: a harness fault, not the model's outcome
     if status not in EXCLUDED_STATUSES:
         return True, None
     if stop == "provider_error":  # the model/provider failed: a real outcome once it has played
@@ -609,7 +611,7 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
         "",
         "**Valid runs.** Completed runs, including those stopped by turn, time or cost limits, plus runs that "
         "ended in a `provider_error` after at least one turn (scored as reached and counted in Errors). Runs "
-        "that hit a harness problem (`grue_error`, `interrupted`, `error`) are excluded and listed at the end; "
+        "that hit a harness problem (`grue_error`, `interrupted`, `error`, or a game that crashed) are excluded and listed at the end; "
         "their cost still counts. Rows with the same model spec but different settings (temperature, history, "
         "notes, effort, max tokens, max turns, cache, format) are separate rows, labelled with the differing settings.",
         "",
