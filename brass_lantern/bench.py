@@ -322,6 +322,10 @@ def _flat(run: dict[str, Any]) -> dict[str, Any]:
     reached = t.get("max_score_reached")
     peak = max(score, reached) if score is not None and reached is not None else (score if score is not None else reached)
     probe = run.get("memorization") if isinstance(run.get("memorization"), dict) else {}
+    info = run.get("game_info") if isinstance(run.get("game_info"), dict) else {}
+    result = run.get("result") if isinstance(run.get("result"), dict) else {}
+    # Commands the game processed (Grue's count); the model-call count can differ when commands were refused.
+    game_turns = result.get("turn") if isinstance(result.get("turn"), int) else turns
     return {
         "run_id": run.get("run_id"),
         "model": run["model"],
@@ -345,6 +349,10 @@ def _flat(run: dict[str, Any]) -> dict[str, Any]:
         "peak_score": peak,
         "norm": (peak / max_score) if peak is not None and max_score else None,
         "turns": turns,
+        "game_turns": game_turns,
+        "catalog_par": info.get("par") if isinstance(info.get("par"), int) and info.get("par") > 0 else None,
+        "par": None,  # set by aggregate(): the catalog par, else the fewest turns any run in the report won in
+        "efficiency": None,  # set by aggregate(): par / turns for a win, 0 otherwise
         "invalid_commands": t.get("invalid_commands") or 0,
         "parse_failures": t.get("parse_failures") or 0,
         "input_tokens": t.get("input_tokens") or 0,
@@ -416,6 +424,7 @@ def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_norm": _mean(norms),
         "win_rate": sum(r["ending"] == "won" for r in rows) / len(rows) if rows else None,
         "mean_turns": _mean([r["turns"] for r in rows]),
+        "efficiency": _mean([r["efficiency"] for r in rows if r["efficiency"] is not None]),
         "invalid_rate": sum(r["invalid_commands"] for r in rows) / turns if turns else None,
         "parse_failure_rate": sum(r["parse_failures"] for r in rows) / turns if turns else None,
     }
@@ -472,6 +481,20 @@ def ranked_games_for(
     ]
 
 
+def _pars(flat: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Each game's par: the catalog's walkthrough length, else the fewest turns any valid run in the report won in."""
+    out: dict[str, dict[str, Any]] = {}
+    for g in sorted({r["game"] for r in flat}):
+        rows = [r for r in flat if r["game"] == g]
+        catalog = next((r["catalog_par"] for r in rows if r["catalog_par"]), None)
+        wins = [r["game_turns"] for r in rows if r["counted"] and r["ending"] == "won" and r["game_turns"]]
+        if catalog:
+            out[g] = {"par": catalog, "source": "walkthrough"}
+        elif wins:
+            out[g] = {"par": min(wins), "source": "best run"}
+    return out
+
+
 def aggregate(
     runs: list[dict[str, Any]], rank_games: list[str] | None = None, rank_unprobed: bool = False
 ) -> dict[str, Any]:
@@ -479,8 +502,15 @@ def aggregate(
     games = sorted({r["game"] for r in flat})
     variants = _variants(flat)
     ranked_games = ranked_games_for(flat, rank_games, rank_unprobed)
+    par = _pars(flat)
     for r in flat:
         r["ranked"] = r["game"] in ranked_games and _rankable(r, rank_unprobed)
+        p = par.get(r["game"])
+        if p and r["counted"]:
+            r["par"] = p["par"]
+            r["efficiency"] = p["par"] / max(r["game_turns"], p["par"]) if r["ending"] == "won" else 0.0
+        elif r["counted"] and r["max_score"]:
+            r["efficiency"] = 0.0  # nobody won and there is no catalog par: no run earns efficiency
     models: dict[str, Any] = {}
     for label, info in variants.items():
         mine = [r for r in flat if r["variant"] == label]
@@ -494,9 +524,12 @@ def aggregate(
         overall = _stats(ranked)
         # Games weigh equally, and a ranked game with no ranked run counts as 0 (never skipped), so a
         # model cannot climb the ranking by failing on the hard games (or by skipping the probe).
-        ranked_norms = {g: _stats([r for r in ranked if r["game"] == g])["mean_norm"] for g in ranked_games}
+        ranked_stats = {g: _stats([r for r in ranked if r["game"] == g]) for g in ranked_games}
+        ranked_norms = {g: s["mean_norm"] for g, s in ranked_stats.items()}
         overall["missing_games"] = [g for g, n in ranked_norms.items() if n is None]
         overall["norm_score"] = _mean([n if n is not None else 0.0 for n in ranked_norms.values()])
+        # Efficiency weighs games equally too: a ranked game with no ranked run (or no win) counts as 0.
+        overall["efficiency"] = _mean([s["efficiency"] or 0.0 for s in ranked_stats.values()])
         overall["cost_usd"] = _cost(mine)  # money spent counts even on excluded and unranked runs
         overall["input_tokens"] = sum(r["input_tokens"] for r in mine)
         overall["output_tokens"] = sum(r["output_tokens"] for r in mine)
@@ -508,6 +541,7 @@ def aggregate(
         models,
         key=lambda m: (
             -(models[m]["overall"]["norm_score"] if models[m]["overall"]["norm_score"] is not None else -1),
+            -(models[m]["overall"]["efficiency"] or 0),
             -(models[m]["overall"]["win_rate"] or 0),
             models[m]["overall"]["cost_usd"] or 0,
         ),
@@ -522,6 +556,7 @@ def aggregate(
         "games": games,
         "ranked_games": ranked_games,
         "rank_unprobed": rank_unprobed,
+        "par": par,
         "memorized_games": sorted({r["game"] for r in flat if r["probe"] == "positive"}),
         "ranking": ranking,
         "models": models,
@@ -556,6 +591,11 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
         "it has no ranked run counts as 0 and is marked `*`. The other columns of the overall table describe the "
         "ranked runs too, except Cost, which is everything spent (all runs and probes).",
         "",
+        "**Efficiency** (the tiebreak after Score) = how directly a model wins: a won run scores par / turns taken "
+        "(1.0 = as short as the walkthrough), any other run 0. Par is the game's walkthrough length from the "
+        "catalog, or else the fewest turns any run in this report won in (so it can change as runs are added). "
+        "Overall efficiency is the mean over the ranked games, like Score.",
+        "",
         "**Memorization probe.** Before playing, the model sees only the game's opening and is asked to write the "
         "winning commands from memory; they are replayed blind. If that replay wins or reaches "
         f"{PROBE_THRESHOLD:.0%} of the max score, the model knows the solution: the probe is positive "
@@ -578,8 +618,8 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
         "",
         "## Overall ranking",
         "",
-        "| # | Model | Score | Win rate | Mean turns | Invalid % | Format fail % | Cost | Ranked runs (all, excl.) | Errors |",
-        "|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|",
+        "| # | Model | Score | Efficiency | Win rate | Mean turns | Invalid % | Format fail % | Cost | Ranked runs (all, excl.) | Errors |",
+        "|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|",
     ]
     any_missing = False
     for rank, m in enumerate(agg["ranking"], 1):
@@ -587,7 +627,8 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
         star = " \\*" if o["missing_games"] else ""
         any_missing = any_missing or bool(o["missing_games"])
         lines.append(
-            f"| {rank} | `{m}` | {_pct(o['norm_score'])}{star} | {_pct(o['win_rate'], 0)} | {_num(o['mean_turns'], 0)} | "
+            f"| {rank} | `{m}` | {_pct(o['norm_score'])}{star} | {_num(o['efficiency'], 2)} | {_pct(o['win_rate'], 0)} | "
+            f"{_num(o['mean_turns'], 0)} | "
             f"{_pct(o['invalid_rate'])} | {_pct(o['parse_failure_rate'])} | {fmt_cost(o['cost_usd'])} | "
             f"{o['runs']} ({o['all_runs']}, {o['excluded_runs']}) | {o['provider_errors']} |"
         )
@@ -610,21 +651,24 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
             lines.append(f"| `{m}` | " + " | ".join(cells) + " |")
     for g in games:
         max_score = next((s["max_score"] for m in models.values() for gg, s in m["games"].items() if gg == g and s["max_score"]), None)
+        par = agg.get("par", {}).get(g)
+        facts = ([f"max score {max_score}"] if max_score else []) + (
+            [f"par {par['par']}" + (" from the best run" if par["source"] == "best run" else "")] if par else [])
         lines += [
             "",
-            f"## {g}" + (f" (max score {max_score})" if max_score else ""),
+            f"## {g}" + (f" ({', '.join(facts)})" if facts else ""),
             "",
-            "| Model | Mean peak | % of max | Best | Win rate | Mean turns | Invalid % | Cost | Runs | Errors | Memorized |",
-            "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|",
+            "| Model | Mean peak | % of max | Best | Efficiency | Win rate | Mean turns | Invalid % | Cost | Runs | Errors | Memorized |",
+            "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|",
         ]
         played = [m for m in agg["ranking"] if models[m]["games"].get(g)]
         # Best first within the game; ties keep the overall ranking order (sorted() is stable).
-        played.sort(key=lambda m: -(models[m]["games"][g]["mean_score"] or 0))
+        played.sort(key=lambda m: (-(models[m]["games"][g]["mean_score"] or 0), -(models[m]["games"][g]["efficiency"] or 0)))
         for m in played:
             s = models[m]["games"][g]
             lines.append(
                 f"| `{m}` | {_num(s['mean_score'])} | {_pct(s['mean_norm'])} | {s['best_score']} | "
-                f"{_pct(s['win_rate'], 0)} | {_num(s['mean_turns'], 0)} | {_pct(s['invalid_rate'])} | "
+                f"{_num(s['efficiency'], 2)} | {_pct(s['win_rate'], 0)} | {_num(s['mean_turns'], 0)} | {_pct(s['invalid_rate'])} | "
                 f"{fmt_cost(s['cost_usd'])} | {s['runs']} | {s['provider_errors']} | {s['probe']} |"
             )
     excluded = agg["excluded"]
@@ -640,7 +684,8 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
 CSV_FIELDS = [
     "run_id", "model", "variant", "game", "status", "stop_reason", "counted", "excluded_reason", "probe", "probe_peak",
     "probe_cost_usd", "ranked", "ending",
-    "score", "max_score", "max_score_reached", "peak_score", "norm", "turns", "invalid_commands", "parse_failures",
+    "score", "max_score", "max_score_reached", "peak_score", "norm", "turns", "game_turns", "par", "efficiency",
+    "invalid_commands", "parse_failures",
     "input_tokens", "output_tokens", "cost_usd", "cost_source", "wall_time_s", "temperature", "history", "notes",
     "effort", "max_tokens", "max_turns", "cache", "history_step", "format", "cache_read_tokens", "cache_write_tokens",
 ]

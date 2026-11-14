@@ -546,6 +546,38 @@ def test_runs_without_a_negative_probe_are_unranked_unless_rank_unprobed():
     assert aggregate([make_run("B", "g", 50, 50, probe=None)])["ranked_games"] == []
 
 
+def test_efficiency_breaks_ties_on_score_using_par():
+    def won(model, turns, par=None, **kw):
+        r = make_run(model, "g", 50, 50, ending="won", turns=turns, **kw)
+        r["game_info"] = {"tags": ["original"], "difficulty": "medium", "par": par}
+        return r
+
+    # Catalog par: B won faster, so B ranks first although both scored 100%.
+    agg = aggregate([won("A", 200, 76), won("B", 100, 76), won("B", 50, 76)])
+    assert agg["par"] == {"g": {"par": 76, "source": "walkthrough"}}
+    assert agg["ranking"] == ["B", "A"]
+    assert agg["models"]["A"]["overall"]["efficiency"] == pytest.approx(0.38)
+    assert agg["models"]["B"]["overall"]["efficiency"] == pytest.approx((0.76 + 1.0) / 2), "under par caps at 1.0"
+    md = render_leaderboard(agg)
+    assert "## g (max score 50, par 76)" in md and "| Efficiency |" in md and "0.38" in md
+
+    # No catalog par: the best winning run sets it; runs that did not win score 0.
+    lost = make_run("C", "g", 10, 50, turns=300)
+    agg = aggregate([won("A", 200), won("B", 100), lost])
+    assert agg["par"]["g"] == {"par": 100, "source": "best run"}
+    effs = {r["model"]: r["efficiency"] for r in agg["rows"]}
+    assert effs == {"A": 0.5, "B": 1.0, "C": 0.0}
+    assert "par 100 from the best run" in render_leaderboard(agg)
+
+    # Grue's own turn count wins over the model-call count.
+    r = won("A", 120, 60)
+    r["result"] = {"turn": 100}
+    assert aggregate([r])["rows"][0]["efficiency"] == pytest.approx(0.6)
+
+    # Nobody won and no par: every scored run gets 0, not "n/a".
+    assert aggregate([make_run("A", "g", 10, 50)])["models"]["A"]["overall"]["efficiency"] == 0.0
+
+
 def test_a_shared_probe_is_billed_once():
     runs = [make_run("A", "g", 10, 50, run_id=f"r{i}", cost=0.1) for i in range(3)]
     for r in runs:

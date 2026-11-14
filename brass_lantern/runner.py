@@ -312,7 +312,8 @@ async def play_episode(
                 # A URL game has no catalog entry: never borrow a catalog game's tags because the labels match.
                 g = None if cfg.game_url else next((g for g in await grue.list_games() if g.id == cfg.game), None)
                 if g is not None:
-                    game_info = {"tags": list(g.tags), "difficulty": g.difficulty, "private": bool(g.raw.get("private"))}
+                    game_info = {"tags": list(g.tags), "difficulty": g.difficulty, "private": bool(g.raw.get("private")),
+                                 "par": g.par}
             except GrueError:
                 pass  # only used to decide which games a leaderboard ranks, and to name the game to the probe
             if probe is None:

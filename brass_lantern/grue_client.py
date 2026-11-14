@@ -51,6 +51,7 @@ class Game:
     max_score: int | None = None
     difficulty: str | None = None
     suggested_turn_limit: int | None = None
+    par: int | None = None  # commands in a known full-score winning walkthrough
     tags: list[str] = field(default_factory=list)
     description: str | None = None
     license: str | None = None

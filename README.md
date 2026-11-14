@@ -278,6 +278,12 @@ A bench also writes `bench.json` (its settings, with `"version": 1`, used by `--
 - **Configurations:** runs are grouped by model spec (including any `@effort`) **and** the settings that change behaviour
   (temperature as sent, history, notes, effort, max tokens, max turns, cache, format). If one spec was run with different settings, each configuration is its own
   row, labelled with the settings that differ, e.g. `openrouter:x (notes, h=30)`. Identical configurations merge.
+- **Efficiency** (the tiebreak after Score, then win rate, then cost) = how directly a model wins. A won run scores
+  par / turns taken, capped at 1.0 (1.0 = as short as the walkthrough); any other run scores 0. **Par** is the
+  game's walkthrough length from the Grue catalog (`par`, recorded in run.json's `game_info`), or else the fewest
+  turns any valid run in the report won in, so a best-run par can move as runs are added. Turns are Grue's count of
+  commands processed. Overall efficiency is the mean over the ranked games, like Score. It separates models on games
+  they all win; on hard games, where nobody wins, it is 0 for everyone and Score does the work.
 - **Win rate** = share of runs Grue ended as `won`. Games often end by `turn_limit` instead, so score is the main signal.
 - **Invalid %** = parser rejections per command, as counted by Grue. **Format fail %** = replies without a `> COMMAND` line.
 
