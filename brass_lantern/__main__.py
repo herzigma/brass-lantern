@@ -10,7 +10,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Sequence
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -57,7 +57,7 @@ def _csv(value: str) -> list[str]:
 
 def _url_label(url: str) -> str:
     """A short name for a --game-url run (its file name without extension), used in the run id and run.json."""
-    stem = Path(urlparse(url).path).stem
+    stem = Path(unquote(urlparse(url).path)).stem
     return re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-")[:40] or "url"
 
 

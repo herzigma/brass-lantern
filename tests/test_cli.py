@@ -190,3 +190,7 @@ def test_bench_cost_cap_allowed_with_prices_openrouter_or_no_cap(patched_grue, t
     idle.write_text("north\n", encoding="utf-8")
     assert cli.main(["bench", "--models", f"mock:{idle}", "--games", "tiny", "--runs", "1", "--max-turns", "2",
                      "--max-cost-per-run", "1", "--out", str(tmp_path / "ok")]) == 0
+
+
+def test_url_label_decodes_escapes():
+    assert cli._url_label("https://unbox.ifarchive.org/1roirbwtf8/Tableaux%20Vivants.gblorb") == "Tableaux-Vivants"
