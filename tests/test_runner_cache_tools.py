@@ -260,7 +260,7 @@ def test_cache_and_format_split_runs_into_separate_labelled_variants():
         make_run("m", "g", 8, 10, config={**BASE, "cache": True, "format": "tools"}, run_id="d"),  # merges with c
         make_run("solo", "g", 5, 10, config={**BASE, "cache": True, "format": "text"}, run_id="e"),
     ]
-    agg = aggregate(runs)
+    agg = aggregate(runs, rank_unprobed=True)  # runs from before the memorization probe
     assert set(agg["models"]) == {"m (cache, format=text)", "m (no cache, format=text)", "m (cache, format=tools)", "solo"}
     assert agg["models"]["m (cache, format=tools)"]["overall"]["runs"] == 2
     assert agg["models"]["m (cache, format=tools)"]["config"]["format"] == "tools"

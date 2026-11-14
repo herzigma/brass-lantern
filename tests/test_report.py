@@ -313,7 +313,8 @@ def test_runs_from_before_effort_called_it_reasoning_still_merge_with_new_ones()
         return {"run_id": rid, "model": "openrouter:x/y", "game": "g", "status": "completed", "stop_reason": "game_over",
                 "config": {"temperature": 0.7, **config}, "totals": {"turns": 5, "score": 1, "max_score": 10}}
 
-    agg = aggregate([make({"reasoning": "high"}, "old"), make({"effort": "high"}, "new"), make({"reasoning": None}, "none")])
+    agg = aggregate([make({"reasoning": "high"}, "old"), make({"effort": "high"}, "new"), make({"reasoning": None}, "none")],
+                    rank_unprobed=True)  # runs from before the memorization probe
     assert set(agg["models"]) == {"openrouter:x/y (effort=high)", "openrouter:x/y (effort=default)"}
     assert agg["models"]["openrouter:x/y (effort=high)"]["overall"]["runs"] == 2
 

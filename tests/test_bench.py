@@ -18,8 +18,9 @@ from fake_grue import WIN_SCRIPT
 
 
 def make_run(model, game, score, max_score, *, ending="turn_limit", turns=100, invalid=0, pf=0, cost=0.1,
-             status="completed", run_id=None, stop_reason=None, config=None):
+             status="completed", run_id=None, stop_reason=None, config=None, probe="negative"):
     return {
+        "memorization": {"status": probe} if probe else None,
         "run_id": run_id or f"{model}-{game}-{score}-{ending}-{status}",
         "model": model, "game": game, "status": status,
         "stop_reason": stop_reason or ("game_over" if status == "completed" else status),
@@ -87,10 +88,11 @@ def test_leaderboard_markdown():
     assert "71.4%" in overall[0]  # (150/350 + 1)/2 = 0.7142...
     assert r"50.0% \*" in overall[1] and "- (=0)" in md  # C: zork never played -> counted as 0, marked
     assert "150.0 (43%)" in md  # score matrix cell
-    assert "2 (0)" not in md and "2 (1)" in overall[2]  # B: 2 counted runs, 1 excluded
+    assert "2 (3, 1)" in overall[2]  # B: 2 ranked runs of 3, 1 excluded
     assert "n/a" in overall[1]  # C has no cost
     assert "## Excluded runs" in md and "B-zork-340-turn_limit-error" in md
-    assert "mean over the RANKED games" in md and "peak in-game score" in md  # the formula is documented at the top
+    assert "mean over the ranked games" in md and "peak in-game score" in md  # the formula is documented at the top
+    assert "Memorization probe." in md and "| Memorized |" in md
     assert md.index("Score formula") < md.index("## Overall ranking")
 
 
@@ -233,7 +235,7 @@ def test_provider_error_runs_count_if_played_and_are_flagged_harness_errors_are_
     assert "| Errors |" in md and "## Excluded runs" in md
     assert "| grue |" in md and "grue_error" in md and "pe-played" not in md
     overall_row = next(ln for ln in md.splitlines() if ln.startswith("| 1 |"))
-    assert overall_row.endswith("| 2 (4) | 1 |")
+    assert overall_row.endswith("| 2 (6, 4) | 1 |")
     # no exclusions -> no section
     assert "## Excluded runs" not in render_leaderboard(aggregate([make_run("A", "g", 1, 10)]))
 
@@ -497,25 +499,57 @@ def _info(run, tags, difficulty="medium"):
     return run
 
 
-def test_only_original_non_tutorial_games_are_ranked():
-    runs = [
+def _probe_runs():
+    return [
         _info(make_run("A", "held", 40, 50), ["original", "private"]),
         _info(make_run("A", "tutorial", 10, 10, ending="won"), ["original"], "tutorial"),
         _info(make_run("A", "zork", 35, 350), ["classic"], "hard"),
         _info(make_run("B", "held", 10, 50), ["original", "private"]),
         _info(make_run("B", "tutorial", 10, 10, ending="won"), ["original"], "tutorial"),
-        _info(make_run("B", "zork", 350, 350, ending="won"), ["classic"], "hard"),
+        _info(make_run("B", "zork", 350, 350, ending="won", probe="positive"), ["classic"], "hard"),
     ]
+
+
+def test_only_probe_negative_runs_of_unmemorized_non_tutorial_games_are_ranked():
+    runs = _probe_runs()
     agg = aggregate(runs)
-    assert agg["ranked_games"] == ["held"]
+    assert agg["ranked_games"] == ["held"], "tutorials never rank; B's positive probe takes Zork out for everyone"
+    assert agg["memorized_games"] == ["zork"]
     assert agg["ranking"] == ["A", "B"], "B's memorized Zork win does not count"
     assert abs(agg["models"]["A"]["overall"]["norm_score"] - 0.8) < 1e-9
+    assert agg["models"]["A"]["overall"]["runs"] == 1 and agg["models"]["A"]["overall"]["all_runs"] == 3
+    assert agg["models"]["B"]["games"]["zork"]["probe"] == "memorized"
+    assert agg["models"]["A"]["games"]["zork"]["probe"] == "no"
     md = render_leaderboard(agg)
-    assert "**Ranked games:** `held`" in md and "zork (unranked)" in md
-    # an explicit list wins
-    assert aggregate(runs, ["zork"])["ranking"] == ["B", "A"]
+    assert "**Ranked games:** `held`" in md and "zork (unranked)" in md and "(memorized: `zork`)" in md
+    # an explicit list replaces the tutorial rule, but not the probe rule
+    assert aggregate(runs, ["tutorial"])["ranked_games"] == ["tutorial"]
+    assert aggregate(runs, ["zork"])["ranked_games"] == []
 
 
-def test_bench_without_original_games_ranks_every_scored_game():
-    agg = aggregate(RUNS)  # no game_info at all (older runs, or classics only)
-    assert agg["ranked_games"] == ["tiny", "zork"]
+def test_runs_without_a_negative_probe_are_unranked_unless_rank_unprobed():
+    runs = [
+        make_run("A", "g", 40, 50),  # negative
+        make_run("B", "g", 50, 50, probe=None),  # from before the probe existed
+        make_run("C", "g", 50, 50, probe="skipped"),
+        make_run("D", "g", 50, 50, probe="error"),
+    ]
+    agg = aggregate(runs)
+    assert agg["ranking"][0] == "A"
+    for m in "BCD":
+        assert agg["models"][m]["overall"]["norm_score"] == 0.0 and agg["models"][m]["overall"]["missing_games"] == ["g"]
+    assert [r["ranked"] for r in agg["rows"]] == [True, False, False, False]
+    loose = aggregate(runs, rank_unprobed=True)
+    assert all(r["ranked"] for r in loose["rows"]) and loose["models"]["B"]["overall"]["norm_score"] == 1.0
+    assert "--rank-unprobed" in render_leaderboard(loose)
+    # with no probe-negative run at all, nothing is ranked (old benches need --rank-unprobed)
+    assert aggregate([make_run("B", "g", 50, 50, probe=None)])["ranked_games"] == []
+
+
+def test_a_shared_probe_is_billed_once():
+    runs = [make_run("A", "g", 10, 50, run_id=f"r{i}", cost=0.1) for i in range(3)]
+    for r in runs:
+        r["memorization"] = {"status": "negative", "session_id": "probe-1", "cost_usd": 0.05}
+    agg = aggregate(runs)
+    assert agg["models"]["A"]["overall"]["cost_usd"] == pytest.approx(0.35)
+    assert agg["rows"][0]["probe_cost_usd"] == 0.05

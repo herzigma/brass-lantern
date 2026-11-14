@@ -35,7 +35,8 @@ brass-lantern play --game zork1 --model openrouter:anthropic/claude-haiku-4.5 --
 brass-lantern play --game-url https://www.ifarchive.org/if-archive/games/zcode/LostPig.z8 --model mock:script.txt
 ```
 
-You will see the game text, then `🤖 [n] command` with the running score, spend and latency.
+A real model is first given the [memorization probe](#how-scoring-works) (one extra call, and a blind replay on
+the server), then plays. You will see the game text, then `🤖 [n] command` with the running score, spend and latency.
 Use `--quiet` to print only the final summary line. Ctrl-C ends the session cleanly and still writes the run files.
 
 ### Against the hosted server
@@ -230,7 +231,9 @@ Each episode writes `runs/<run_id>/` (run ids look like `20261112-210000-zork1-o
   (`completed` | `interrupted` | `error`), stop reason (`game_over`, `max_turns`, `max_cost`, `max_time`,
   `max_calls`, `provider_error`, `grue_error`, `interrupted`, `error`), Grue's final `Result`, and totals: turns, score, max score,
   ending, input/output tokens, cache read/write tokens and hit rate, cost and `cost_source` (`provider`, `prices` or
-  `null`), wall time, parse failures, invalid commands.
+  `null`), wall time, parse failures, invalid commands, and `memorization` (the
+  [probe](#how-scoring-works): `status`, recalled `commands`, the blind replay's `peak_score` and `ending`, its
+  `session_id`, tokens and `cost_usd`).
 - `transcript.jsonl`: one line per turn with the observation the model saw, the raw model reply, the command sent,
   parse method, tokens (including cache reads and writes), any tool calls, cost, latency and finish reason; plus a final
   line with the last observation.
@@ -244,14 +247,26 @@ A bench also writes `bench.json` (its settings, with `"version": 1`, used by `--
 - **Score** = the run's peak in-game score: the highest score Grue saw it reach (`max_score_reached`), which is what
   TALES and TextQuests rank on. The final score is kept as `score` in `results.csv`. **Normalized score** = peak / max
   score. A finished run that never reported a score but whose game has a max score counts as 0.
-- **Ranked games** = the original, non-tutorial games in the bench (from the game's catalog tags, recorded in each
-  run.json as `game_info`). Classics are left out because models have memorized them, and tutorials because every
-  model wins them; both still get their own tables. A bench with no original games ranks every game that has a max
-  score. `--rank-games id,id` (on `bench` or `report`) sets the list explicitly.
-- **Overall ranking** = the mean, over the ranked games, of the model's per-game mean normalized score (each game
-  weighs the same regardless of repeat counts). A ranked game where the model has no valid run counts as 0 and is
-  marked `*` (and `- (=0)` in the per-game matrix), so a model cannot rank higher by failing on hard games. The
-  formula is repeated at the top of `leaderboard.md`.
+- **Memorization probe** (on by default): before a model plays a game, it is shown only the game's opening text (and
+  the catalog title and author, if any) and asked to write the winning commands from memory. Brass Lantern replays
+  them blind in a separate Grue session (`meta.agent` `"probe"`, which Grue leaves out of its results lists). If the
+  replay wins or reaches 5% of the max score, the model knows the solution and the probe is **positive**; otherwise
+  **negative**. A bench probes each model and game once and shares the verdict with its repeats (a resumed bench reuses
+  it). The verdict, recalled commands, replay score and probe cost are in `run.json` under `memorization`; the cost counts
+  in the leaderboard's Cost column. `--no-memorization-probe` (on `play` and `bench`) skips it, which leaves the runs
+  unranked. Mock and human runs are never probed.
+- **Ranked runs** = valid runs whose probe came back negative, in a ranked game. **Ranked games** = games with a max
+  score that are not tutorials (every model wins those), where at least one run is ranked and no model's probe was
+  positive: if one model knows the solution, the game cannot fairly compare models. `--rank-games id,id` (on `bench`
+  or `report`) replaces the tutorial rule with an explicit list; the probe rules still apply. Unranked games still get
+  their own tables, with a **Memorized** column (`no`, `memorized`, `untested`, `error` or `mixed`).
+- **Runs from before the probe** have no verdict, so they are unranked. `report <dir> --rank-unprobed` ranks runs whose
+  probe was never run, skipped or failed (games some probe found memorized stay out).
+- **Overall ranking** = the mean, over the ranked games, of the model's per-game mean normalized score over its ranked
+  runs (each game weighs the same regardless of repeat counts). A ranked game where the model has no ranked run counts
+  as 0 and is marked `*` (and `- (=0)` in the per-game matrix), so a model cannot rank higher by failing on hard games
+  or skipping the probe. The win rate, turns, invalid and format columns of the overall table also describe ranked runs
+  only; Cost is everything spent. The formula is repeated at the top of `leaderboard.md`.
 - **Valid runs** are those that count in the scores:
   - completed runs, including ones stopped by `--max-turns`, `--max-cost`, `--max-time` or `max_calls`;
   - runs that ended in `provider_error` after at least one turn: the model or provider failing is a real outcome, so they

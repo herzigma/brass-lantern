@@ -16,7 +16,8 @@ from typing import Any
 from brass_lantern import __version__
 from brass_lantern.agent import HISTORY_STEP, Agent
 from brass_lantern.console import Reporter
-from brass_lantern.grue_client import GrueClient, GrueError, Observation, Result
+from brass_lantern.grue_client import Game, GrueClient, GrueError, Observation, Result
+from brass_lantern.memprobe import run_probe, skipped
 from brass_lantern.prices import CACHE_READ_FACTOR, CACHE_WRITE_FACTOR, Price, as_price
 from brass_lantern.providers import Completion, ConfigError, Provider, ProviderError, parse_spec
 
@@ -53,6 +54,8 @@ class RunConfig:
     meta: dict[str, Any] = field(default_factory=dict)  # extra session meta
     game_url: str | None = None  # play this story file URL (unranked) instead of the catalog game; `game` is then a label
     sha256: str | None = None  # expected SHA-256 of the file at game_url
+    memorization_probe: bool = True  # probe whether the model knows the game's solution before playing it
+    probe_result: dict[str, Any] | None = None  # a probe already run for this model and game (a bench shares one)
     # USD per 1M tokens, for providers that report no cost: a Price, or just (input, output)
     price: Price | tuple[float, float] | None = None
 
@@ -141,6 +144,17 @@ async def send_report(grue: GrueClient, session_id: str, report: dict[str, Any],
     return {"accepted": False, "error": problem}
 
 
+async def probe_for(cfg: RunConfig, *, grue: GrueClient, provider: Provider, game: Game | None) -> dict[str, Any]:
+    """The memorization probe for this run's model and game, or a "skipped" record when it is turned off."""
+    if not cfg.memorization_probe:
+        return skipped("turned off (--no-memorization-probe)")
+    return await run_probe(
+        grue=grue, provider=provider, game=cfg.game, model=cfg.model,
+        title=game.title if game else None, author=game.author if game else None,
+        game_url=cfg.game_url, sha256=cfg.sha256, price=as_price(cfg.price),
+    )
+
+
 async def play_episode(
     cfg: RunConfig,
     *,
@@ -186,6 +200,7 @@ async def play_episode(
     agent: Agent | None = None
     report_state: dict[str, Any] | None = None  # set once the client report was attempted
     game_info: dict[str, Any] | None = None  # the game's catalog tags/difficulty, used to decide what is ranked
+    probe: dict[str, Any] | None = cfg.probe_result  # memorization probe verdict; only "negative" runs are ranked
 
     def build_summary(final: bool) -> dict[str, Any]:
         score = result.score if result and result.score is not None else (obs.score if obs else None)
@@ -202,6 +217,7 @@ async def play_episode(
             "game": cfg.game,
             "game_url": cfg.game_url,
             "game_info": game_info,
+            "memorization": probe,
             "session_id": session_id,
             "started_at": started_at,
             "ended_at": now_iso() if final else None,
@@ -291,15 +307,20 @@ async def play_episode(
             transcript.flush()
 
         try:
-            obs = await grue.start_session(cfg.game, cfg.max_turns, meta, game_url=cfg.game_url, sha256=cfg.sha256)
-            session_id = obs.session_id
+            g: Game | None = None
             try:
-                # A URL game is unranked: never borrow a catalog game's tags because the labels match.
+                # A URL game has no catalog entry: never borrow a catalog game's tags because the labels match.
                 g = None if cfg.game_url else next((g for g in await grue.list_games() if g.id == cfg.game), None)
                 if g is not None:
                     game_info = {"tags": list(g.tags), "difficulty": g.difficulty, "private": bool(g.raw.get("private"))}
             except GrueError:
-                pass  # only used to decide which games a leaderboard ranks
+                pass  # only used to decide which games a leaderboard ranks, and to name the game to the probe
+            if probe is None:
+                probe = await probe_for(cfg, grue=grue, provider=provider, game=g)
+                write_run_json(final=False)
+            reporter.probe(probe)
+            obs = await grue.start_session(cfg.game, cfg.max_turns, meta, game_url=cfg.game_url, sha256=cfg.sha256)
+            session_id = obs.session_id
             max_turns = cfg.max_turns
             if max_turns is None:  # learn the limit the server applied (the game's suggested one)
                 try:

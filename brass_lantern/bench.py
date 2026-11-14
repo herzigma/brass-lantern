@@ -16,11 +16,12 @@ from typing import Any, Callable
 
 from brass_lantern import __version__
 from brass_lantern.console import Reporter, fmt_cost, fmt_duration
-from brass_lantern.grue_client import GrueClient
+from brass_lantern.grue_client import GrueClient, GrueError
+from brass_lantern.memprobe import PROBE_THRESHOLD
 from brass_lantern.prices import Price, parse_prices, price_for
 from brass_lantern.providers import ConfigError, Provider, Settings, create_provider, resolve_settings
 from brass_lantern.providers.models import DEFAULT_MAX_TOKENS
-from brass_lantern.runner import RunConfig, make_run_id, play_episode
+from brass_lantern.runner import RunConfig, make_run_id, play_episode, probe_for
 
 # Runs that did not finish for infrastructure reasons say nothing about the model
 # (a provider_error that played at least one turn is the exception; see _counted).
@@ -47,6 +48,7 @@ class BenchConfig:
     grue_url: str | None = None
     out_dir: Path = Path("runs")
     prices: dict[str, Price] = field(default_factory=dict)  # model spec -> USD per 1M tokens
+    memorization_probe: bool = True  # probe each model x game once before its runs; only negative probes rank
 
 
 def _sent_settings(cfg: BenchConfig, spec: str) -> Settings:
@@ -100,6 +102,32 @@ async def run_bench(
     sem = asyncio.Semaphore(max(1, cfg.concurrency))
     summaries: list[dict[str, Any]] = []
     started = time.monotonic()
+    # One memorization probe per model x game, shared by its repeats; a resumed bench reuses finished ones.
+    probes: dict[tuple[str, str], asyncio.Future] = {}
+    for run in ([] if fresh else load_runs(out)):
+        verdict = run.get("memorization") or {}
+        if verdict.get("status") in ("positive", "negative"):
+            done: asyncio.Future = asyncio.get_running_loop().create_future()
+            done.set_result(verdict)
+            probes.setdefault((run.get("game"), run.get("model")), done)
+
+    async def shared_probe(run_cfg: RunConfig) -> dict[str, Any]:
+        key = (run_cfg.game, run_cfg.model)
+        if key not in probes:
+            probes[key] = asyncio.ensure_future(_probe_once(run_cfg))
+        return await asyncio.shield(probes[key])
+
+    async def _probe_once(run_cfg: RunConfig) -> dict[str, Any]:
+        provider = make_provider(run_cfg.model)
+        try:
+            game = None
+            try:
+                game = next((g for g in await grue.list_games() if g.id == run_cfg.game), None)
+            except GrueError:
+                pass
+            return await probe_for(run_cfg, grue=grue, provider=provider, game=game)
+        finally:
+            await provider.aclose()
 
     async def worker(i: int, game: str, spec: str) -> None:
         async with sem:
@@ -124,7 +152,9 @@ async def run_bench(
                 quiet=True,
                 meta={"bench": out.name, "repeat": i + 1},
                 price=price_for(cfg.prices, spec),
+                memorization_probe=cfg.memorization_probe,
             )
+            run_cfg.probe_result = await shared_probe(run_cfg)
             provider = make_provider(spec)
             try:
                 summary = await play_episode(run_cfg, grue=grue, provider=provider, reporter=Reporter(quiet=True))
@@ -291,6 +321,7 @@ def _flat(run: dict[str, Any]) -> dict[str, Any]:
     # Peak = the highest score reached (what TALES and TextQuests rank on); the final score can be lower.
     reached = t.get("max_score_reached")
     peak = max(score, reached) if score is not None and reached is not None else (score if score is not None else reached)
+    probe = run.get("memorization") if isinstance(run.get("memorization"), dict) else {}
     return {
         "run_id": run.get("run_id"),
         "model": run["model"],
@@ -301,6 +332,12 @@ def _flat(run: dict[str, Any]) -> dict[str, Any]:
         "stop_reason": run.get("stop_reason"),
         "counted": counted,
         "excluded_reason": reason,
+        # Memorization probe: "negative" (ranked), "positive" (memorized), "error", "skipped", or "none" (not run)
+        "probe": probe.get("status") or "none",
+        "probe_peak": probe.get("peak_score"),
+        "probe_session": probe.get("session_id"),
+        "probe_cost_usd": probe.get("cost_usd"),
+        "ranked": False,  # set by aggregate()
         "ending": t.get("ending"),
         "score": score,
         "max_score": max_score,
@@ -385,55 +422,86 @@ def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _cost(rows: list[dict[str, Any]]) -> float | None:
+    """Money spent on these runs, including their memorization probes (each probe once: repeats share one)."""
     known = [r["cost_usd"] for r in rows if r["cost_usd"] is not None]
+    probes = {r["probe_session"] or r["run_id"]: r["probe_cost_usd"] for r in rows if r["probe_cost_usd"] is not None}
+    known += probes.values()
     return sum(known) if known else None
 
 
-def _benchmark_game(info: dict[str, Any] | None) -> bool:
-    """An original (or held-out) game that is not a tutorial: the kind a ranking should rest on."""
-    if not isinstance(info, dict):
-        return False
-    tags = info.get("tags") or []
-    return ("original" in tags or bool(info.get("private"))) and info.get("difficulty") != "tutorial"
+def _probe_label(rows: list[dict[str, Any]]) -> str:
+    """One model's probe outcome on one game, for the per-game tables."""
+    statuses = {r["probe"] for r in rows}
+    if "positive" in statuses:
+        return "memorized"
+    if statuses == {"negative"}:
+        return "no"
+    if statuses <= {"none", "skipped"}:
+        return "untested"
+    return "error" if statuses == {"error"} else "mixed"
 
 
-def ranked_games_for(flat: list[dict[str, Any]], rank_games: list[str] | None = None) -> list[str]:
+def _rankable(row: dict[str, Any], rank_unprobed: bool) -> bool:
+    """A valid run whose memorization probe came back negative (or was never run, with --rank-unprobed)."""
+    return row["counted"] and (
+        row["probe"] == "negative" or (rank_unprobed and row["probe"] in ("none", "skipped", "error"))
+    )
+
+
+def ranked_games_for(
+    flat: list[dict[str, Any]], rank_games: list[str] | None = None, rank_unprobed: bool = False
+) -> list[str]:
     """Which games the overall score averages over.
 
-    ``rank_games`` wins when given. Otherwise: the original, non-tutorial games in the bench (classics are
-    memorized and tutorials are won by everyone, so neither separates models); if the bench has none of those,
-    every game with a known max score, as before.
+    A game is ranked when it has a max score, is not a tutorial (tutorials are won by everyone), has at least
+    one valid run whose memorization probe came back negative, and no model's probe found it memorized: one
+    model knowing the solution makes the game useless for comparing models. ``rank_games`` replaces the
+    tutorial rule with an explicit list; the probe rules still apply.
     """
     games = sorted({r["game"] for r in flat})
     scored = [g for g in games if any(r["game"] == g and r["max_score"] for r in flat)]
     if rank_games:
-        return [g for g in scored if g in rank_games]
-    originals = [g for g in scored if any(r["game"] == g and _benchmark_game(r.get("game_info")) for r in flat)]
-    return originals or scored
+        candidates = [g for g in scored if g in rank_games]
+    else:
+        candidates = [g for g in scored if not any(
+            r["game"] == g and (r.get("game_info") or {}).get("difficulty") == "tutorial" for r in flat)]
+    return [
+        g for g in candidates
+        if not any(r["game"] == g and r["probe"] == "positive" for r in flat)
+        and any(r["game"] == g and _rankable(r, rank_unprobed) for r in flat)
+    ]
 
 
-def aggregate(runs: list[dict[str, Any]], rank_games: list[str] | None = None) -> dict[str, Any]:
+def aggregate(
+    runs: list[dict[str, Any]], rank_games: list[str] | None = None, rank_unprobed: bool = False
+) -> dict[str, Any]:
     flat = [_flat(r) for r in runs]
     games = sorted({r["game"] for r in flat})
     variants = _variants(flat)
-    ranked_games = ranked_games_for(flat, rank_games)
+    ranked_games = ranked_games_for(flat, rank_games, rank_unprobed)
+    for r in flat:
+        r["ranked"] = r["game"] in ranked_games and _rankable(r, rank_unprobed)
     models: dict[str, Any] = {}
     for label, info in variants.items():
         mine = [r for r in flat if r["variant"] == label]
         valid = [r for r in mine if r["counted"]]
+        ranked = [r for r in mine if r["ranked"]]
         per_game = {g: _stats([r for r in valid if r["game"] == g]) for g in games if any(r["game"] == g for r in valid)}
         for g, s in per_game.items():
             s["cost_usd"] = _cost([r for r in mine if r["game"] == g])
-        overall = _stats(valid)
-        # Games weigh equally, and a ranked game with no scored run counts as 0 (never skipped), so a
-        # model cannot climb the ranking by failing on the hard games.
-        norms = {g: (per_game[g]["mean_norm"] if g in per_game else None) for g in ranked_games}
-        overall["missing_games"] = [g for g, n in norms.items() if n is None]
-        overall["norm_score"] = _mean([n if n is not None else 0.0 for n in norms.values()])
-        overall["cost_usd"] = _cost(mine)  # money spent counts even on excluded runs
+            s["probe"] = _probe_label([r for r in mine if r["game"] == g])
+        # The overall row describes the ranked runs only: probe-negative runs of ranked games.
+        overall = _stats(ranked)
+        # Games weigh equally, and a ranked game with no ranked run counts as 0 (never skipped), so a
+        # model cannot climb the ranking by failing on the hard games (or by skipping the probe).
+        ranked_norms = {g: _stats([r for r in ranked if r["game"] == g])["mean_norm"] for g in ranked_games}
+        overall["missing_games"] = [g for g, n in ranked_norms.items() if n is None]
+        overall["norm_score"] = _mean([n if n is not None else 0.0 for n in ranked_norms.values()])
+        overall["cost_usd"] = _cost(mine)  # money spent counts even on excluded and unranked runs
         overall["input_tokens"] = sum(r["input_tokens"] for r in mine)
         overall["output_tokens"] = sum(r["output_tokens"] for r in mine)
         overall["excluded_runs"] = len(mine) - len(valid)
+        overall["all_runs"] = len(mine)
         models[label] = {"spec": info["spec"], "config": info["config"], "overall": overall, "games": per_game}
 
     ranking = sorted(
@@ -453,6 +521,8 @@ def aggregate(runs: list[dict[str, Any]], rank_games: list[str] | None = None) -
         "n_runs": len(runs),
         "games": games,
         "ranked_games": ranked_games,
+        "rank_unprobed": rank_unprobed,
+        "memorized_games": sorted({r["game"] for r in flat if r["probe"] == "positive"}),
         "ranking": ranking,
         "models": models,
         "excluded": excluded,
@@ -479,13 +549,23 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
         f"{agg['n_runs']} runs, {len(models)} models, {len(games)} games. Generated {agg['generated_at']}.",
         "",
         "**Score formula.** A run's score is its peak in-game score (the highest it reached) divided by the "
-        "game's maximum (a finished run that never reported a score counts as 0). A model's per-game score is the "
-        "mean over its valid runs in that game. Its overall score is the mean over the RANKED games: a ranked game "
-        "where the model has no valid run counts as 0 and is marked `*`, so failing on hard games cannot raise its rank.",
+        "game's maximum (a finished run that never reported a score counts as 0). Only RANKED runs count: valid "
+        "runs of a ranked game whose memorization probe came back negative"
+        + (" or was never run (`--rank-unprobed`)" if agg.get("rank_unprobed") else "") + ". "
+        "A model's overall score is the mean over the ranked games of its mean score in each; a ranked game where "
+        "it has no ranked run counts as 0 and is marked `*`. The other columns of the overall table describe the "
+        "ranked runs too, except Cost, which is everything spent (all runs and probes).",
         "",
-        f"**Ranked games:** {', '.join(f'`{g}`' for g in agg['ranked_games']) or 'none'}. By default these are the "
-        "original, non-tutorial games (classics are memorized and tutorials are won by everyone); `--rank-games` "
-        "overrides. Other games are shown below but do not count.",
+        "**Memorization probe.** Before playing, the model sees only the game's opening and is asked to write the "
+        "winning commands from memory; they are replayed blind. If that replay wins or reaches "
+        f"{PROBE_THRESHOLD:.0%} of the max score, the model knows the solution: the probe is positive "
+        "(`memorized` below).",
+        "",
+        f"**Ranked games:** {', '.join(f'`{g}`' for g in agg['ranked_games']) or 'none'}. A game is ranked when "
+        "it has a max score, is not a tutorial (`--rank-games` gives an explicit list instead), has at least one "
+        "ranked run, and no model's probe found it memorized"
+        + (f" (memorized: {', '.join(f'`{g}`' for g in agg.get('memorized_games', []))})" if agg.get("memorized_games") else "")
+        + ". Other games are shown below but do not count.",
         "",
         "**Valid runs.** Completed runs, including those stopped by turn, time or cost limits, plus runs that "
         "ended in a `provider_error` after at least one turn (scored as reached and counted in Errors). Runs "
@@ -498,7 +578,7 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
         "",
         "## Overall ranking",
         "",
-        "| # | Model | Score | Win rate | Mean turns | Invalid % | Format fail % | Cost | Runs (excl.) | Errors |",
+        "| # | Model | Score | Win rate | Mean turns | Invalid % | Format fail % | Cost | Ranked runs (all, excl.) | Errors |",
         "|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|",
     ]
     any_missing = False
@@ -509,10 +589,11 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
         lines.append(
             f"| {rank} | `{m}` | {_pct(o['norm_score'])}{star} | {_pct(o['win_rate'], 0)} | {_num(o['mean_turns'], 0)} | "
             f"{_pct(o['invalid_rate'])} | {_pct(o['parse_failure_rate'])} | {fmt_cost(o['cost_usd'])} | "
-            f"{o['runs']} ({o['excluded_runs']}) | {o['provider_errors']} |"
+            f"{o['runs']} ({o['all_runs']}, {o['excluded_runs']}) | {o['provider_errors']} |"
         )
     if any_missing:
-        lines += ["", "\\* counts at least one game with no valid run as 0 (see the `- (=0)` cells below)."]
+        lines += ["", "\\* counts at least one ranked game with no ranked run as 0 (no valid run, or its probe "
+                  "was not negative)."]
     if games:
         heads = [g if g in agg["ranked_games"] else f"{g} (unranked)" for g in games]
         lines += ["", "## Mean peak score by game", "", "| Model | " + " | ".join(heads) + " |", "|---|" + "--:|" * len(games)]
@@ -533,8 +614,8 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
             "",
             f"## {g}" + (f" (max score {max_score})" if max_score else ""),
             "",
-            "| Model | Mean peak | % of max | Best | Win rate | Mean turns | Invalid % | Cost | Runs | Errors |",
-            "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|",
+            "| Model | Mean peak | % of max | Best | Win rate | Mean turns | Invalid % | Cost | Runs | Errors | Memorized |",
+            "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|",
         ]
         played = [m for m in agg["ranking"] if models[m]["games"].get(g)]
         # Best first within the game; ties keep the overall ranking order (sorted() is stable).
@@ -544,7 +625,7 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
             lines.append(
                 f"| `{m}` | {_num(s['mean_score'])} | {_pct(s['mean_norm'])} | {s['best_score']} | "
                 f"{_pct(s['win_rate'], 0)} | {_num(s['mean_turns'], 0)} | {_pct(s['invalid_rate'])} | "
-                f"{fmt_cost(s['cost_usd'])} | {s['runs']} | {s['provider_errors']} |"
+                f"{fmt_cost(s['cost_usd'])} | {s['runs']} | {s['provider_errors']} | {s['probe']} |"
             )
     excluded = agg["excluded"]
     if excluded:
@@ -557,18 +638,21 @@ def render_leaderboard(agg: dict[str, Any]) -> str:
 
 
 CSV_FIELDS = [
-    "run_id", "model", "variant", "game", "status", "stop_reason", "counted", "excluded_reason", "ending",
+    "run_id", "model", "variant", "game", "status", "stop_reason", "counted", "excluded_reason", "probe", "probe_peak",
+    "probe_cost_usd", "ranked", "ending",
     "score", "max_score", "max_score_reached", "peak_score", "norm", "turns", "invalid_commands", "parse_failures",
     "input_tokens", "output_tokens", "cost_usd", "cost_source", "wall_time_s", "temperature", "history", "notes",
     "effort", "max_tokens", "max_turns", "cache", "history_step", "format", "cache_read_tokens", "cache_write_tokens",
 ]
 
 
-def write_reports(directory: str | Path, runs: list[dict[str, Any]], rank_games: list[str] | None = None) -> dict[str, Any]:
+def write_reports(
+    directory: str | Path, runs: list[dict[str, Any]], rank_games: list[str] | None = None, rank_unprobed: bool = False
+) -> dict[str, Any]:
     """Write leaderboard.md, results.csv and summary.json into *directory*."""
     d = Path(directory)
     d.mkdir(parents=True, exist_ok=True)
-    agg = aggregate(runs, rank_games)
+    agg = aggregate(runs, rank_games, rank_unprobed)
     (d / "leaderboard.md").write_text(render_leaderboard(agg), encoding="utf-8")
     with (d / "results.csv").open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")

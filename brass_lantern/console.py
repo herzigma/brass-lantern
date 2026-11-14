@@ -42,6 +42,17 @@ class Reporter:
         if not self.quiet:
             self._print(f"== Brass Lantern  run {run_id}\n== {game} | {model} | up to {max_turns} turns\n")
 
+    def probe(self, probe: dict[str, Any]) -> None:
+        if self.quiet:
+            return
+        status = probe.get("status")
+        detail = probe.get("reason") or probe.get("error")
+        if detail is None and status in ("positive", "negative"):
+            peak, max_score = probe.get("peak_score"), probe.get("max_score")
+            score = "?" if peak is None else (f"{peak}/{max_score}" if max_score else str(peak))
+            detail = f"blind replay of {len(probe.get('commands') or [])} recalled commands scored {score}"
+        self._print(f"== memorization probe: {status}" + (f" ({detail})" if detail else "") + "\n")
+
     def observation(self, text: str) -> None:
         if not self.quiet:
             self._print(text.strip() or "(no text)", "\n")
