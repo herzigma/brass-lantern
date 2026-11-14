@@ -50,6 +50,27 @@ def patched_grue(monkeypatch, fake):
     return fake
 
 
+def test_play_command_with_game_url(patched_grue, tmp_path):
+    script = tmp_path / "win.txt"
+    script.write_text("\n".join(WIN_SCRIPT), encoding="utf-8")
+    url = "https://www.ifarchive.org/if-archive/games/zcode/zork1.z3"
+    code = cli.main(["play", "--game-url", url, "--sha256", "a" * 64, "--model", f"mock:{script}",
+                     "--out", str(tmp_path / "runs"), "--run-id", "u1", "--quiet"])
+    assert code == 0
+    start = next(b for m, p, b in patched_grue.requests if (m, p) == ("POST", "/api/sessions"))
+    assert start["game_url"] == url and start["sha256"] == "a" * 64 and "game" not in start
+    run = json.loads((tmp_path / "runs" / "u1" / "run.json").read_text(encoding="utf-8"))
+    assert run["game"] == "zork1" and run["game_url"] == url
+    assert run["game_info"] is None, "a URL game never borrows the catalog zork1's tags"
+
+
+def test_play_needs_exactly_one_game(patched_grue, tmp_path):
+    with pytest.raises(SystemExit):
+        cli.main(["play", "--model", "mock:x.txt"])
+    with pytest.raises(SystemExit):
+        cli.main(["play", "--game", "tiny", "--game-url", "https://ifarchive.org/x.z5", "--model", "mock:x.txt"])
+
+
 def test_games_command(patched_grue, capsys):
     assert cli.main(["games"]) == 0
     out = capsys.readouterr().out

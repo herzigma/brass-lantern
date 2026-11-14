@@ -117,7 +117,11 @@ class FakeGrue:
     # -- game logic --------------------------------------------------------
 
     def _start(self, body: dict) -> httpx.Response:
-        if body.get("game") not in ("tiny", "tiny2"):
+        if body.get("game_url"):  # an unranked URL game: same tiny world, its own id
+            if body.get("game") is not None:
+                return self._err(400, "bad_request")
+            body = {**body, "game": "url-0123456789ab"}
+        elif body.get("game") not in ("tiny", "tiny2"):
             return self._err(404, "unknown_game")
         if self.session_cap is not None and sum(not s["game_over"] for s in self.sessions.values()) >= self.session_cap:
             return self._err(429, "too_many_sessions")

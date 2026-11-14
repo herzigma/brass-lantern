@@ -51,6 +51,8 @@ class RunConfig:
     run_id: str | None = None
     quiet: bool = False
     meta: dict[str, Any] = field(default_factory=dict)  # extra session meta
+    game_url: str | None = None  # play this story file URL (unranked) instead of the catalog game; `game` is then a label
+    sha256: str | None = None  # expected SHA-256 of the file at game_url
     # USD per 1M tokens, for providers that report no cost: a Price, or just (input, output)
     price: Price | tuple[float, float] | None = None
 
@@ -198,6 +200,7 @@ async def play_episode(
             "error": error,
             "model": cfg.model,
             "game": cfg.game,
+            "game_url": cfg.game_url,
             "game_info": game_info,
             "session_id": session_id,
             "started_at": started_at,
@@ -288,10 +291,11 @@ async def play_episode(
             transcript.flush()
 
         try:
-            obs = await grue.start_session(cfg.game, cfg.max_turns, meta)
+            obs = await grue.start_session(cfg.game, cfg.max_turns, meta, game_url=cfg.game_url, sha256=cfg.sha256)
             session_id = obs.session_id
             try:
-                g = next((g for g in await grue.list_games() if g.id == cfg.game), None)
+                # A URL game is unranked: never borrow a catalog game's tags because the labels match.
+                g = None if cfg.game_url else next((g for g in await grue.list_games() if g.id == cfg.game), None)
                 if g is not None:
                     game_info = {"tags": list(g.tags), "difficulty": g.difficulty, "private": bool(g.raw.get("private"))}
             except GrueError:

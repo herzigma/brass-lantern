@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Sequence
+from urllib.parse import urlparse
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -51,6 +53,12 @@ def _temperature(value: str) -> float | None:
 
 def _csv(value: str) -> list[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def _url_label(url: str) -> str:
+    """A short name for a --game-url run (its file name without extension), used in the run id and run.json."""
+    stem = Path(urlparse(url).path).stem
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-")[:40] or "url"
 
 
 def _kv(value: str) -> tuple[str, str]:
@@ -115,7 +123,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--grue-url", help="Grue server URL")
 
     p = sub.add_parser("play", help="play one episode", epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--game", required=True, help="game id (see `brass-lantern games`)")
+    which = p.add_mutually_exclusive_group(required=True)
+    which.add_argument("--game", help="game id (see `brass-lantern games`)")
+    which.add_argument("--game-url", metavar="URL",
+                       help="play a story file from this https URL instead (Z-code, Glulx or Blorb on a host the server "
+                            "allows, e.g. ifarchive.org); the run is unranked")
+    p.add_argument("--sha256", help="with --game-url: the file's expected SHA-256, to pin the exact release")
     p.add_argument("--model", required=True, help="provider:model spec (see below)")
     p.add_argument("--max-cost", type=float, help="stop when spent dollars reach this (needs cost data; see --prices)")
     p.add_argument("--max-time", type=float, help="stop after this many seconds")
@@ -172,7 +185,7 @@ async def _play(args: argparse.Namespace) -> int:
     sent = resolve_settings(args.model, effort=args.effort, temperature=args.temperature, max_tokens=args.max_tokens,
                             base_url=args.base_url)  # what is really sent: this is what gets recorded
     cfg = RunConfig(
-        game=args.game, model=args.model, max_turns=args.max_turns, max_cost=args.max_cost, max_time=args.max_time,
+        game=args.game or _url_label(args.game_url), game_url=args.game_url, sha256=args.sha256, model=args.model, max_turns=args.max_turns, max_cost=args.max_cost, max_time=args.max_time,
         history=args.history, notes=args.notes, format=args.format, cache=args.cache == "on",
         temperature=sent.temperature, max_tokens=sent.max_tokens, effort=sent.effort,
         base_url=args.base_url, grue_url=args.grue_url, out_dir=Path(args.out), run_id=args.run_id,

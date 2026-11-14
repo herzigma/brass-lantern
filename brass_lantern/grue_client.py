@@ -194,9 +194,13 @@ class GrueClient:
         return [_build(Game, g) for g in body.get("games", [])]
 
     async def start_session(
-        self, game: str, max_turns: int | None = None, meta: dict[str, Any] | None = None
+        self, game: str | None, max_turns: int | None = None, meta: dict[str, Any] | None = None,
+        game_url: str | None = None, sha256: str | None = None,
     ) -> Observation:
-        payload: dict[str, Any] = {"game": game}
+        """Start a catalog game by id, or (with ``game_url``) an unranked game from a story file URL."""
+        payload: dict[str, Any] = {"game_url": game_url} if game_url else {"game": game}
+        if game_url and sha256:
+            payload["sha256"] = sha256
         if max_turns is not None:
             payload["max_turns"] = max_turns
         if meta:
